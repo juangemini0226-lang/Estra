@@ -11,8 +11,10 @@ st.set_page_config(page_title="Masas | Extractor", page_icon="⚖️", layout="w
 st.title("⚖️ Masa Transformada - Panel Unificado")
 st.write("Carga el CSV de consumos de material, extrae OT/Material/Masa, visualiza el comportamiento y sincroniza con Google Sheets.")
 
-# URL de Google Sheets
-SHEET_URL = 'https://docs.google.com/spreadsheets/d/1lRg2Fc1pk3HBfXkYwXhWnFlTAGxx9gvoZ4hRnJ1AhXY/edit#gid=0'
+# URL de Google Sheets — apunta al documento y a la pestaña específica de destino.
+SHEET_URL = 'https://docs.google.com/spreadsheets/d/1lRg2Fc1pk3HBfXkYwXhWnFlTAGxx9gvoZ4hRnJ1AhXY/edit?gid=2109835940#gid=2109835940'
+NOMBRE_HOJA_DESTINO = "Material_Data"
+GID_ESPERADO = 2109835940  # extraído de la URL de arriba, para validar que no cambió
 
 
 @st.cache_resource
@@ -21,6 +23,32 @@ def conectar_sheets():
     creds_dict = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     return gspread.authorize(creds)
+
+
+def conectar_hoja_destino():
+    """
+    Capa de seguridad: abre el spreadsheet y localiza la pestaña por NOMBRE
+    (no por posición como .sheet1, que podía apuntar a la pestaña equivocada
+    si 'Material_Data' no era la primera hoja). Además valida que el gid de
+    la pestaña encontrada coincida con el gid esperado, para detectar si la
+    hoja fue renombrada, movida o recreada.
+
+    Devuelve: (worksheet, spreadsheet_titulo, lista_hojas_disponibles, gid_coincide)
+    """
+    gc = conectar_sheets()
+    spreadsheet = gc.open_by_url(SHEET_URL)
+    hojas_disponibles = [ws.title for ws in spreadsheet.worksheets()]
+
+    if NOMBRE_HOJA_DESTINO not in hojas_disponibles:
+        raise ValueError(
+            f"No se encontró la pestaña '{NOMBRE_HOJA_DESTINO}' en el documento. "
+            f"Pestañas disponibles: {', '.join(hojas_disponibles)}"
+        )
+
+    worksheet = spreadsheet.worksheet(NOMBRE_HOJA_DESTINO)
+    gid_coincide = (worksheet.id == GID_ESPERADO)
+
+    return worksheet, spreadsheet.title, hojas_disponibles, gid_coincide
 
 
 def extraer_masas(content: bytes) -> pd.DataFrame:
@@ -202,6 +230,7 @@ if 'df_masa_extraida' in st.session_state:
     # PASO 4: CARGAR A GOOGLE SHEETS
     # ─────────────────────────────────────────────────────────
     st.markdown("### 4️⃣ Cargar a Google Sheets")
+
     col_dl, col_up = st.columns(2)
 
     with col_dl:
@@ -215,40 +244,68 @@ if 'df_masa_extraida' in st.session_state:
         )
 
     with col_up:
-        if st.button("☁️ Sincronizar a Google Sheets (sin duplicar)", type="primary", use_container_width=True):
-            with st.spinner("Subiendo registros nuevos..."):
-                try:
-                    gc = conectar_sheets()
-                    sheet = gc.open_by_url(SHEET_URL).sheet1
+        # --- CAPA DE SEGURIDAD: validar destino ANTES de mostrar el botón de subida ---
+        try:
+            worksheet, titulo_doc, hojas_disponibles, gid_coincide = conectar_hoja_destino()
+            destino_valido = True
+        except Exception as e:
+            worksheet, titulo_doc, hojas_disponibles, gid_coincide = None, None, [], False
+            destino_valido = False
+            st.error(f"❌ No se pudo validar el destino en Google Sheets: {e}")
 
-                    st.write("☁️ Conectando a Google Sheets para validación de duplicados...")
-                    keys_existentes, _ = obtener_keys_existentes(sheet)
+        if destino_valido:
+            st.markdown("**📍 Destino verificado:**")
+            st.write(f"📄 Documento: `{titulo_doc}`")
+            st.write(f"📑 Hoja: `{worksheet.title}`")
 
-                    filas_a_subir = []
-                    for _, row in df_masa.iterrows():
-                        r_ot = str(row['OT']).strip()
-                        r_maq = str(row['Maquina']).strip().upper()
-                        r_fec = str(row['Fecha']).strip()
-                        r_id = str(row['Id_Material']).strip().upper()
+            if gid_coincide:
+                st.success(f"✅ El gid de la pestaña coincide con el esperado ({GID_ESPERADO}).")
+            else:
+                st.warning(
+                    f"⚠️ El gid de la pestaña '{NOMBRE_HOJA_DESTINO}' es {worksheet.id}, "
+                    f"distinto al gid esperado ({GID_ESPERADO}). Es posible que la hoja haya sido "
+                    f"movida o recreada. El nombre coincide, así que se puede continuar, pero revísalo."
+                )
 
-                        llave_nueva = f"{r_ot}_{r_maq}_{r_fec}_{r_id}"
+            confirmado = st.checkbox(
+                f"Confirmo que quiero subir los datos a la hoja **{NOMBRE_HOJA_DESTINO}** de arriba.",
+                value=False
+            )
 
-                        if llave_nueva not in keys_existentes:
-                            filas_a_subir.append([
-                                row['Fecha'], row['Maquina'], row['OT'],
-                                row['Id_Material'], row['Nombre_Material'], row['Total']
-                            ])
+            if st.button(
+                "☁️ Sincronizar a Google Sheets (sin duplicar)",
+                type="primary", use_container_width=True, disabled=not confirmado
+            ):
+                with st.spinner("Subiendo registros nuevos..."):
+                    try:
+                        st.write("☁️ Validando duplicados contra la hoja destino...")
+                        keys_existentes, _ = obtener_keys_existentes(worksheet)
 
-                    if filas_a_subir:
-                        sheet.append_rows(filas_a_subir)
-                        st.success(f"🎉 ¡Éxito! Se subieron {len(filas_a_subir)} registros nuevos.")
-                        with st.expander("👀 Ver registros subidos"):
-                            st.dataframe(
-                                pd.DataFrame(filas_a_subir, columns=['Fecha', 'Maquina', 'OT', 'Id_Material', 'Nombre_Material', 'Total']),
-                                use_container_width=True
-                            )
-                    else:
-                        st.info("👍 Todo al día. La información de este archivo ya se encuentra en Google Sheets.")
+                        filas_a_subir = []
+                        for _, row in df_masa.iterrows():
+                            r_ot = str(row['OT']).strip()
+                            r_maq = str(row['Maquina']).strip().upper()
+                            r_fec = str(row['Fecha']).strip()
+                            r_id = str(row['Id_Material']).strip().upper()
 
-                except Exception as e:
-                    st.error(f"❌ Error de conexión con Google Sheets: {e}")
+                            llave_nueva = f"{r_ot}_{r_maq}_{r_fec}_{r_id}"
+
+                            if llave_nueva not in keys_existentes:
+                                filas_a_subir.append([
+                                    row['Fecha'], row['Maquina'], row['OT'],
+                                    row['Id_Material'], row['Nombre_Material'], row['Total']
+                                ])
+
+                        if filas_a_subir:
+                            worksheet.append_rows(filas_a_subir)
+                            st.success(f"🎉 ¡Éxito! Se subieron {len(filas_a_subir)} registros nuevos a '{NOMBRE_HOJA_DESTINO}'.")
+                            with st.expander("👀 Ver registros subidos"):
+                                st.dataframe(
+                                    pd.DataFrame(filas_a_subir, columns=['Fecha', 'Maquina', 'OT', 'Id_Material', 'Nombre_Material', 'Total']),
+                                    use_container_width=True
+                                )
+                        else:
+                            st.info("👍 Todo al día. La información de este archivo ya se encuentra en Google Sheets.")
+
+                    except Exception as e:
+                        st.error(f"❌ Error de conexión con Google Sheets: {e}")
