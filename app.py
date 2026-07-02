@@ -77,7 +77,7 @@ if uploaded_file is not None:
         fila_dict["Producción Total"] = extraer_valor(row, "Producción Total :Total Parts:")
         fila_dict["Producción Buena"] = extraer_valor(row, "Producción Buena :")
         fila_dict["Producción de Rechazo"] = extraer_valor(row, "Producción de Rechazo :")
-        fila_dict["Producción Empacada"] = extraer_valor(row, "Producción Empacada :", 2)[1] if extraer_valor(row, \"Producción Empacada :\", 2) else None
+        fila_dict["Producción Empacada"] = extraer_valor(row, "Producción Empacada :", 2)[1] if extraer_valor(row, "Producción Empacada :", 2) else None
         fila_dict["Ciclos de Máquina"] = extraer_valor(row, "Ciclos de Máquina :Machine Cycles:")
         ciclos_fuera = extraer_valor(row, "Ciclos Fuera Especificación :", 2)
         fila_dict["Ciclos Fuera de Especificación"] = ciclos_fuera[0] if ciclos_fuera else None
