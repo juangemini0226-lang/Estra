@@ -15,8 +15,16 @@ SHEET_URL = 'https://docs.google.com/spreadsheets/d/1lRg2Fc1pk3HBfXkYwXhWnFlTAGx
 
 # Columnas mínimas que DEBE tener cada hoja para ser considerada válida.
 # Esto es lo que reemplaza la suposición de "la primera hoja es Masas".
+# IMPORTANTE: en el archivo real, la hoja de masas es 'Material_Data' y su
+# llave YA se llama 'ID_Job' (no 'OT' como asumía la versión anterior).
 COLUMNAS_REQUERIDAS_PROD = {'Máquina', 'Trabajo / Orden', 'Tiempo Empezar', 'Tiempo Final'}
-COLUMNAS_REQUERIDAS_MASAS = {'OT', 'Total'}
+COLUMNAS_REQUERIDAS_MASAS = {'ID_Job', 'Total'}
+
+# Nombres "preferidos" cuando hay más de una hoja candidata (p.ej.
+# 'producción SEC' y 'producción detallada' comparten las mismas columnas
+# base, así que sin esta preferencia quedarían ambiguas cada vez).
+HOJA_PROD_PREFERIDA = "produccion SEC"
+HOJA_MASAS_PREFERIDA = "Material_Data"
 
 # ==========================================
 # FUNCIONES DE CONEXIÓN Y DESCARGA
@@ -146,8 +154,13 @@ with col_a:
         hoja_prod_elegida = candidatas_prod[0]
         st.success(f"✅ Hoja de Producción detectada: **{hoja_prod_elegida}**")
     else:
-        st.warning(f"⚠️ Varias hojas califican como Producción: {candidatas_prod}")
-        hoja_prod_elegida = st.selectbox("Confirma la hoja de Producción:", candidatas_prod)
+        # Varias hojas comparten las mismas columnas (ej. 'producción SEC' y
+        # 'producción detallada'). Si el nombre preferido está entre las
+        # candidatas, lo usamos como default en vez de forzar a elegir.
+        st.info(f"ℹ️ Varias hojas califican como Producción: {candidatas_prod}. "
+                f"Se preseleccionó '{HOJA_PROD_PREFERIDA}' por ser la hoja esperada; cambia si no aplica.")
+        idx_default = candidatas_prod.index(HOJA_PROD_PREFERIDA) if HOJA_PROD_PREFERIDA in candidatas_prod else 0
+        hoja_prod_elegida = st.selectbox("Confirma la hoja de Producción:", candidatas_prod, index=idx_default)
 
 with col_b:
     if len(candidatas_masas) == 0:
@@ -157,8 +170,10 @@ with col_b:
         hoja_masas_elegida = candidatas_masas[0]
         st.success(f"✅ Hoja de Masas detectada: **{hoja_masas_elegida}**")
     else:
-        st.warning(f"⚠️ Varias hojas califican como Masas: {candidatas_masas}")
-        hoja_masas_elegida = st.selectbox("Confirma la hoja de Masas:", candidatas_masas)
+        st.info(f"ℹ️ Varias hojas califican como Masas: {candidatas_masas}. "
+                f"Se preseleccionó '{HOJA_MASAS_PREFERIDA}' por ser la hoja esperada; cambia si no aplica.")
+        idx_default = candidatas_masas.index(HOJA_MASAS_PREFERIDA) if HOJA_MASAS_PREFERIDA in candidatas_masas else 0
+        hoja_masas_elegida = st.selectbox("Confirma la hoja de Masas:", candidatas_masas, index=idx_default)
 
 with st.spinner(f"Descargando '{hoja_prod_elegida}' y '{hoja_masas_elegida}'..."):
     df_prod_raw = descargar_hoja(hoja_prod_elegida)
@@ -204,13 +219,16 @@ if uploaded_energia is not None:
                 df_prod = df_prod.dropna(subset=['Inicio_Limpio', 'Fin_Limpio'])
 
                 # --- PREPARAR MASAS ---
-                st.write("⚖️ Consolidando Masas por OT...")
+                # En 'Material_Data' la llave YA se llama 'ID_Job' (no 'OT').
+                # Se limpia igual que el ID_Job del lado de Producción para
+                # garantizar que el merge encuentre coincidencias.
+                st.write("⚖️ Consolidando Masas por ID_Job...")
                 df_masas = df_masas_raw.copy()
-                df_masas['OT'] = df_masas['OT'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip().str.upper().str.lstrip('0')
+                df_masas['ID_Job'] = df_masas['ID_Job'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
                 df_masas['Total'] = df_masas['Total'].astype(str).str.replace(',', '.', regex=False)
                 df_masas['Total'] = pd.to_numeric(df_masas['Total'], errors='coerce')
-                df_masas_agg = df_masas.groupby('OT', as_index=False)['Total'].sum()
-                df_masas_agg.rename(columns={'OT': 'ID_Job', 'Total': 'Total_Masa_Kg'}, inplace=True)
+                df_masas_agg = df_masas.groupby('ID_Job', as_index=False)['Total'].sum()
+                df_masas_agg.rename(columns={'Total': 'Total_Masa_Kg'}, inplace=True)
 
                 # --- MERGE PRODUCCIÓN + MASAS ---
                 st.write("🔗 Uniendo Producción y Masas...")
@@ -219,7 +237,7 @@ if uploaded_energia is not None:
                     st.warning("⚠️ El cruce Producción↔Masas dio 0 filas. Revisa que los ID_Job/OT coincidan en formato "
                                 "(la muestra de ambos lados se puede ver abajo).")
                     st.write("Ejemplos ID_Job Producción:", df_prod['ID_Job'].unique()[:5].tolist())
-                    st.write("Ejemplos OT Masas (ya normalizado a ID_Job):", df_masas_agg['ID_Job'].unique()[:5].tolist())
+                    st.write("Ejemplos ID_Job Masas:", df_masas_agg['ID_Job'].unique()[:5].tolist())
                 df_consolidado['ID_Maquina_Normalizado'] = df_consolidado['ID_Maquina'].apply(normalizar_maquina)
 
                 # --- PREPARAR ENERGÍA ---
