@@ -677,7 +677,19 @@ if 'df_sec_calculado' in st.session_state:
     st.markdown("## 📊 Tablero de Resultados SEC")
     df_board = st.session_state['df_sec_calculado'].copy()
 
-    col1, col2, col3, col4 = st.columns(4)
+    # Bandera clara de "esta OT sí tiene un dato de SEC utilizable" (energía encontrada + masa + ventana confiable).
+    df_board['SEC_Viable'] = df_board['SEC_Total_kWh_kg'].notna()
+
+    n_total_ots = len(df_board)
+    n_viables = int(df_board['SEC_Viable'].sum())
+    n_no_viables = n_total_ots - n_viables
+
+    st.markdown(
+        f"**{n_viables} de {n_total_ots} OTs** ({(n_viables/n_total_ots*100 if n_total_ots else 0):.0f}%) "
+        f"tienen datos de energía viables y ya muestran su SEC calculado."
+    )
+
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         maquinas = ['Todas'] + sorted(df_board['ID_Maquina_Normalizado'].dropna().unique().tolist())
         filtro_maq = st.selectbox("🏭 Máquina:", maquinas)
@@ -688,6 +700,11 @@ if 'df_sec_calculado' in st.session_state:
         solo_solapes = st.checkbox("⚠️ Solo con solape de ventana", value=False)
     with col4:
         solo_no_cuadra = st.checkbox("⚠️ Solo Producción sin cuadre", value=False)
+    with col5:
+        filtro_sec = st.selectbox(
+            "⚡ SEC calculado:",
+            ["Todas", "✅ Solo con SEC viable", "🚫 Solo sin SEC (sin datos viables)"]
+        )
 
     if filtro_maq != 'Todas':
         df_board = df_board[df_board['ID_Maquina_Normalizado'] == filtro_maq]
@@ -697,17 +714,25 @@ if 'df_sec_calculado' in st.session_state:
         df_board = df_board[df_board['Solape_Ventana_Energia'] == True]
     if solo_no_cuadra:
         df_board = df_board[df_board['Produccion_Cuadra'] == False]
+    if filtro_sec == "✅ Solo con SEC viable":
+        df_board = df_board[df_board['SEC_Viable']]
+    elif filtro_sec == "🚫 Solo sin SEC (sin datos viables)":
+        df_board = df_board[~df_board['SEC_Viable']]
+
+    # Las OTs con SEC viable van primero, para que salten a la vista de inmediato.
+    df_board = df_board.sort_values('SEC_Viable', ascending=False)
 
     st.markdown("#### Indicadores Globales (Según filtro)")
-    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
     kpi1.metric("Órdenes Procesadas", f"{len(df_board)}")
-    kpi2.metric("Masa Total (Kg)", f"{df_board['Total_Masa_Kg'].sum():,.2f}")
-    kpi3.metric("Energía Total (kWh)", f"{df_board['Energia_Total_kWh'].sum():,.2f}")
+    kpi2.metric("✅ Con SEC viable", f"{int(df_board['SEC_Viable'].sum())}")
+    kpi3.metric("Masa Total (Kg)", f"{df_board['Total_Masa_Kg'].sum():,.2f}")
+    kpi4.metric("Energía Total (kWh)", f"{df_board['Energia_Total_kWh'].sum():,.2f}")
     masa_total = df_board['Total_Masa_Kg'].sum()
     sec_promedio = df_board['Energia_Total_kWh'].sum() / masa_total if masa_total > 0 else 0
-    kpi4.metric("SEC Total Promedio (kWh/kg)", f"{sec_promedio:.4f}")
+    kpi5.metric("SEC Total Promedio (kWh/kg)", f"{sec_promedio:.4f}")
     pct_alta = (df_board['Confiabilidad'] == 'Alta').mean() * 100 if len(df_board) > 0 else 0
-    kpi5.metric("% OTs Confiabilidad Alta", f"{pct_alta:.0f}%")
+    kpi6.metric("% OTs Confiabilidad Alta", f"{pct_alta:.0f}%")
 
     st.markdown("#### SEC en sus 3 variantes")
     s1, s2, s3 = st.columns(3)
@@ -733,14 +758,25 @@ if 'df_sec_calculado' in st.session_state:
     n2.metric("⚡ Energía en Rechazo", f"{energia_nc_total:,.2f} kWh")
     n3.metric("📦 Unidades Rechazadas", f"{rechazo_total:,.0f}")
 
+    df_tabla = df_board.copy()
+    df_tabla['SEC_Viable'] = df_tabla['SEC_Viable'].map({True: '✅ Sí', False: '🚫 No'})
+
     st.dataframe(
-        df_board[['ID_Job', 'ID_Maquina', 'Inicio_Limpio', 'Fin_Limpio', 'Total_Masa_Kg', 'Masa_Buena_Kg',
+        df_tabla[['SEC_Viable', 'ID_Job', 'ID_Maquina', 'Inicio_Limpio', 'Fin_Limpio', 'Total_Masa_Kg', 'Masa_Buena_Kg',
                    'Energia_Total_kWh', 'SEC_Total_kWh_kg', 'SEC_Inyeccion_kWh_kg', 'SEC_Conforme_kWh_kg',
                    'Producción de Rechazo', 'Costo_No_Conformidad', 'Energia_Desperdiciada_Rechazo_kWh',
                    'Cobertura_Pct', 'Continuidad_Pct', 'Confiabilidad', 'Ventana_Confiable',
                    'Solape_Ventana_Energia', 'Produccion_Cuadra']],
         use_container_width=True
     )
+
+    if n_no_viables > 0:
+        st.caption(
+            f"ℹ️ Las {n_no_viables} OTs marcadas con 🚫 no tienen SEC calculado porque: no se encontró ninguna "
+            f"lectura de energía en su ventana de tiempo, la ventana de tiempo no era confiable (columna "
+            f"`Ventana_Confiable` = False), o no tienen masa asociada > 0. Usa el Inspector de Orden de abajo "
+            f"para ver la razón exacta de cada caso."
+        )
 
     # ==========================================
     # 🔍 INSPECTOR DE ORDEN — trazabilidad completa por OT
