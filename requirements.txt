@@ -3,3 +3,4 @@ pandas
 gspread
 gspread-dataframe
 google-auth
+plotly
