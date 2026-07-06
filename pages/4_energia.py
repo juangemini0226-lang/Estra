@@ -206,8 +206,48 @@ def parsear_potencia(json_resp):
     df['Fecha y hora'] = pd.to_datetime(df['timestamp_ms'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('America/Bogota').dt.tz_localize(None).dt.floor('min')
     return df.groupby('Fecha y hora', as_index=False)['Potencia [kW]'].max()
 
-# --- INTERFAZ DE USUARIO ---
+# --- CONSULTA DE LA BASE DE DATOS EN DRIVE ---
 st.divider()
+with st.expander("🔎 Consultar base de datos maestra (Drive)", expanded=False):
+    if st.button("📥 Cargar datos guardados en Drive", use_container_width=True):
+        with st.spinner("Descargando energia.db desde Drive..."):
+            try:
+                drive_service = conectar_drive()
+                file_id = buscar_db_en_drive(drive_service)
+
+                if not file_id:
+                    st.warning("Todavía no existe energia.db en la carpeta de Drive.")
+                else:
+                    descargar_db(drive_service, file_id)
+                    conn = sqlite3.connect(RUTA_LOCAL_DB)
+                    df_bd = pd.read_sql("SELECT * FROM registros_energia ORDER BY Timestamp DESC", conn)
+                    conn.close()
+
+                    st.success(f"✅ Conexión exitosa. La base tiene {len(df_bd)} registros en total.")
+
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Registros totales", f"{len(df_bd):,}")
+                    if not df_bd.empty:
+                        c2.metric("Máquinas distintas", df_bd["ID_Maquina_Texto"].nunique())
+                        c3.metric("Último dato", df_bd["Timestamp"].max())
+
+                    st.markdown("**Últimos 50 registros guardados:**")
+                    st.dataframe(df_bd.head(50), use_container_width=True)
+
+                    st.session_state["df_bd_consulta"] = df_bd
+            except Exception as e:
+                st.error(f"Error al consultar Drive: {e}")
+
+    if "df_bd_consulta" in st.session_state:
+        df_bd = st.session_state["df_bd_consulta"]
+        if not df_bd.empty:
+            maquinas_bd = sorted(df_bd["ID_Maquina_Texto"].dropna().unique().tolist())
+            maq_filtro = st.multiselect("Filtrar por máquina:", options=maquinas_bd, default=maquinas_bd, key="filtro_bd")
+            df_filtrado = df_bd[df_bd["ID_Maquina_Texto"].isin(maq_filtro)]
+            st.dataframe(df_filtrado, use_container_width=True)
+            st.caption(f"Mostrando {len(df_filtrado)} de {len(df_bd)} registros totales.")
+
+# --- INTERFAZ DE USUARIO ---
 col1, col2 = st.columns(2)
 
 with col1:
