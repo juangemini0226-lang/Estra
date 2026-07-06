@@ -2,11 +2,14 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
+import os
+import io
+import sqlite3
 from datetime import datetime, timezone, timedelta
 from requests.auth import HTTPBasicAuth
-import gspread
 from google.oauth2.service_account import Credentials
-from gspread_dataframe import set_with_dataframe, get_as_dataframe
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import plotly.express as px  # <-- LIBRERÍA PARA MEJORES GRÁFICOS
 
 # --- CONFIGURACIÓN DE PÁGINA ---
@@ -24,8 +27,12 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 URL_GRAFANA = "https://kern-iop.tech/api/ds/query"
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1lRg2Fc1pk3HBfXkYwXhWnFlTAGxx9gvoZ4hRnJ1AhXY/edit#gid=0"
 TZ_COLOMBIA = timezone(timedelta(hours=-5))
+
+# --- CONFIGURACIÓN DE ALMACENAMIENTO (Google Drive + SQLite) ---
+FOLDER_ID_DRIVE = "131X02ZCk-UyABfxFMHZD0Loidb1jfIw3"
+NOMBRE_DB = "energia.db"
+RUTA_LOCAL_DB = "/tmp/energia.db"
 
 # 🛠️ DICCIONARIO DE MAPEO INFLUXDB
 MAPEO_INFLUX = {
@@ -44,20 +51,79 @@ MAPEO_INFLUX = {
     38: {"nombre": "H84", "tag_energia": "energy16", "tag_potencia": "energy16"},
     37: {"nombre": "H86", "tag_energia": "energy2", "tag_potencia": "energy2"},
     36: {"nombre": "H64", "tag_energia": "energy13", "tag_potencia": "energy13"},
-    60: {"nombre": "H76", "tag_energia": "energy14", "tag_potencia": "energy14"}, 
+    60: {"nombre": "H76", "tag_energia": "energy14", "tag_potencia": "energy14"},
     41: {"nombre": "H74", "tag_energia": "energy9", "tag_potencia": "energy9"}
 }
 
 # Generamos las opciones del select dinámicamente desde el diccionario
 MAQUINAS_DISPONIBLES = {f"{v['nombre']} ({k})": k for k, v in MAPEO_INFLUX.items()}
 
-# --- FUNCIONES DE CONEXIÓN Y GOOGLE SHEETS ---
+# --- FUNCIONES DE CONEXIÓN A GOOGLE DRIVE ---
 @st.cache_resource
-def conectar_sheets():
-    scope = ["https://www.googleapis.com/auth/spreadsheets"]
+def conectar_drive():
+    """Autoriza el service account con scope de Drive y devuelve el cliente de la API."""
+    scope = ["https://www.googleapis.com/auth/drive"]
     creds_dict = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    return gspread.authorize(creds)
+    return build("drive", "v3", credentials=creds)
+
+
+def buscar_db_en_drive(drive_service):
+    """Busca energia.db dentro de la carpeta de Drive. Devuelve el file_id o None si no existe."""
+    query = f"name='{NOMBRE_DB}' and '{FOLDER_ID_DRIVE}' in parents and trashed=false"
+    resultados = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    archivos = resultados.get("files", [])
+    return archivos[0]["id"] if archivos else None
+
+
+def descargar_db(drive_service, file_id):
+    """Descarga el archivo energia.db de Drive a /tmp."""
+    request = drive_service.files().get_media(fileId=file_id)
+    with io.FileIO(RUTA_LOCAL_DB, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+
+def subir_db(drive_service, file_id=None):
+    """Sube (o actualiza) el archivo energia.db en Drive. Devuelve el file_id."""
+    media = MediaFileUpload(RUTA_LOCAL_DB, mimetype="application/x-sqlite3")
+    if file_id:
+        drive_service.files().update(fileId=file_id, media_body=media).execute()
+        return file_id
+    else:
+        metadata = {"name": NOMBRE_DB, "parents": [FOLDER_ID_DRIVE]}
+        nuevo = drive_service.files().create(body=metadata, media_body=media, fields="id").execute()
+        return nuevo["id"]
+
+
+def preparar_tabla(conn):
+    """Crea la tabla de registros si aún no existe, con clave única para evitar duplicados."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS registros_energia (
+            Timestamp TEXT NOT NULL,
+            ID_Maquina_Texto TEXT,
+            id_maquina_api INTEGER,
+            Energia_kWh REAL,
+            Potencia_kW REAL,
+            UNIQUE(Timestamp, id_maquina_api)
+        )
+    """)
+    conn.commit()
+
+
+def upsertar_dataframe(conn, df):
+    """Inserta los registros nuevos e ignora silenciosamente los que ya existan (misma clave)."""
+    registros = df[["Timestamp", "ID_Maquina_Texto", "id_maquina_api", "Energia_kWh", "Potencia_kW"]].values.tolist()
+    conn.executemany(
+        """INSERT OR IGNORE INTO registros_energia
+           (Timestamp, ID_Maquina_Texto, id_maquina_api, Energia_kWh, Potencia_kW)
+           VALUES (?, ?, ?, ?, ?)""",
+        registros
+    )
+    conn.commit()
+
 
 # --- FUNCIONES DE EXTRACCIÓN GRAFANA / INFLUXDB ---
 def extraer_dataframe_json(json_resp, ref_id, nombre_columna):
@@ -346,46 +412,39 @@ if 'df_energia_extraido' in st.session_state:
         )
 
     with col_up:
-        if st.button("☁️ Sincronizar a Google Sheets (Upsert)", type="primary", use_container_width=True):
-            with st.spinner("Subiendo registros sin duplicar..."):
+        if st.button("☁️ Sincronizar a Google Drive (SQLite)", type="primary", use_container_width=True):
+            with st.spinner("Sincronizando con la base de datos maestra en Drive..."):
                 try:
-                    gc = conectar_sheets()
-                    sh = gc.open_by_url(SHEET_URL)
-                    try:
-                        ws_energia = sh.worksheet("Registro_Energía")
-                        df_existente = get_as_dataframe(ws_energia).dropna(how='all')
+                    drive_service = conectar_drive()
 
-                        claves = ["Timestamp", "id_maquina_api"]
-                        for col in claves:
-                            df_mostrar[col] = df_mostrar[col].astype(str)
-                            if col in df_existente.columns:
-                                df_existente[col] = df_existente[col].astype(str)
-                            else:
-                                df_existente[col] = ""
+                    # 1. Buscar y descargar el .db existente (si ya hay uno en la carpeta)
+                    file_id = buscar_db_en_drive(drive_service)
+                    if file_id:
+                        descargar_db(drive_service, file_id)
+                    elif os.path.exists(RUTA_LOCAL_DB):
+                        os.remove(RUTA_LOCAL_DB)  # aseguramos que no quede un .db viejo de otra sesión
 
-                        df_merged = df_mostrar.merge(df_existente[claves], on=claves, how='left', indicator=True)
-                        df_nuevos = df_merged[df_merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+                    # 2. Abrir/crear la tabla y hacer el upsert
+                    conn = sqlite3.connect(RUTA_LOCAL_DB)
+                    preparar_tabla(conn)
 
-                    except gspread.WorksheetNotFound:
-                        ws_energia = sh.add_worksheet("Registro_Energía", 1000, 20)
-                        df_nuevos = df_mostrar
-                        df_existente = pd.DataFrame()
+                    df_para_db = df_mostrar.copy()
+                    df_para_db["Timestamp"] = df_para_db["Timestamp"].astype(str)
+                    df_para_db["id_maquina_api"] = df_para_db["id_maquina_api"].astype(int)
 
-                    if df_nuevos.empty:
-                        st.info("👍 Todo al día. Los datos extraídos ya existen en Google Sheets.")
+                    antes = conn.execute("SELECT COUNT(*) FROM registros_energia").fetchone()[0]
+                    upsertar_dataframe(conn, df_para_db)
+                    despues = conn.execute("SELECT COUNT(*) FROM registros_energia").fetchone()[0]
+                    conn.close()
+
+                    # 3. Subir el .db actualizado de vuelta a Drive
+                    subir_db(drive_service, file_id)
+
+                    nuevos = despues - antes
+                    if nuevos > 0:
+                        st.success(f"🎉 ¡Éxito! Se agregaron {nuevos} registros nuevos. Total en base: {despues}.")
                     else:
-                        df_nuevos = df_nuevos.fillna("")
-                        columnas_sheet = df_existente.columns.tolist() if not df_existente.empty else df_nuevos.columns.tolist()
-                        for col in columnas_sheet:
-                            if col not in df_nuevos.columns:
-                                df_nuevos[col] = ""
-                        df_nuevos = df_nuevos[columnas_sheet]
+                        st.info(f"👍 Todo al día. Los {len(df_para_db)} registros extraídos ya existían en la base. Total: {despues}.")
 
-                        if df_existente.empty:
-                            set_with_dataframe(ws_energia, df_nuevos)
-                        else:
-                            ws_energia.append_rows(df_nuevos.values.tolist())
-
-                        st.success(f"🎉 ¡Éxito! Se agregaron {len(df_nuevos)} filas nuevas a Sheets.")
                 except Exception as e:
-                    st.error(f"Error de conexión con Sheets: {e}")
+                    st.error(f"Error de conexión con Drive: {e}")
