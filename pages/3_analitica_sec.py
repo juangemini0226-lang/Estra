@@ -2,10 +2,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import io
+import os
 import re
+import sqlite3
+import tempfile
 import datetime as dt
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 # 1. Configuración de la página
 st.set_page_config(page_title="Analítica SEC", page_icon="⚡", layout="wide")
@@ -15,6 +20,12 @@ st.write("Cruza Producción, Masas, Costos y Energía para obtener el SEC por Or
          "incluyendo el impacto de la no conformidad.")
 
 SHEET_URL = 'https://docs.google.com/spreadsheets/d/1lRg2Fc1pk3HBfXkYwXhWnFlTAGxx9gvoZ4hRnJ1AhXY/edit#gid=0'
+
+# --- Ubicación de la base de datos de energía en Drive ---
+CARPETA_ENERGIA_DRIVE_ID = "131X02ZCk-UyABfxFMHZD0Loidb1jfIw3"
+NOMBRE_ARCHIVO_ENERGIA_DB = "energia.db"
+# Nombre de tabla esperado dentro del .db (ajusta aquí si tu tabla se llama distinto).
+TABLA_ENERGIA_PREFERIDA = "registros_energia"
 
 # Columnas mínimas que DEBE tener cada hoja para ser considerada válida.
 COLUMNAS_REQUERIDAS_PROD = {
@@ -34,8 +45,16 @@ EPOCH_EXCEL_DURACION = dt.date(1899, 12, 31)  # base para reconstruir duraciones
 UMBRAL_VENTANA_MIN_HORAS = 2.0   # tolerancia mínima (horas) entre calendario y (activo+inactivo)
 UMBRAL_VENTANA_PCT = 0.20        # tolerancia relativa (20% de la duración calendario)
 
+# Posibles nombres de columnas dentro de energia.db, para tolerar variantes de esquema.
+ALIAS_COLUMNAS_ENERGIA = {
+    'Timestamp': ['Timestamp', 'Fecha y hora', 'fecha_hora', 'timestamp', 'Fecha_Hora'],
+    'ID_Maquina_Texto': ['ID_Maquina_Texto', 'maquina_o_puesto', 'Maquina', 'ID_Maquina', 'maquina'],
+    'Energia_kWh': ['Energia_kWh', 'Energía [kWh]', 'energia_kwh', 'Energia'],
+    'Potencia_kW': ['Potencia_kW', 'Potencia [kW]', 'potencia_kw', 'Potencia'],
+}
+
 # ==========================================
-# FUNCIONES DE CONEXIÓN Y DESCARGA
+# FUNCIONES DE CONEXIÓN Y DESCARGA — GOOGLE SHEETS
 # ==========================================
 @st.cache_resource
 def conectar_sheets():
@@ -74,6 +93,105 @@ def descargar_hoja(nombre_hoja):
     sh = gc.open_by_url(SHEET_URL)
     ws = sh.worksheet(nombre_hoja)  # SIEMPRE por nombre, nunca por posición
     return pd.DataFrame(ws.get_all_records())
+
+
+# ==========================================
+# FUNCIONES DE CONEXIÓN Y DESCARGA — GOOGLE DRIVE (energia.db)
+# ==========================================
+@st.cache_resource
+def conectar_drive():
+    # drive.readonly basta: solo necesitamos leer/descargar el archivo, no crearlo ni editarlo.
+    scope = ["https://www.googleapis.com/auth/drive.readonly"]
+    creds_dict = st.secrets["gcp_service_account"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+    return build('drive', 'v3', credentials=creds)
+
+
+def buscar_archivo_en_drive(nombre_archivo, carpeta_id):
+    """Busca por nombre exacto dentro de una carpeta específica de Drive."""
+    servicio = conectar_drive()
+    query = (
+        f"name = '{nombre_archivo}' and '{carpeta_id}' in parents and trashed = false"
+    )
+    resultado = servicio.files().list(
+        q=query,
+        fields="files(id, name, modifiedTime, size)",
+        spaces='drive'
+    ).execute()
+    archivos = resultado.get('files', [])
+    return archivos[0] if archivos else None
+
+
+def _descargar_bytes_drive(file_id):
+    servicio = conectar_drive()
+    request = servicio.files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buffer.seek(0)
+    return buffer.read()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def descargar_energia_db(_cache_bust=None):
+    """
+    Busca energia.db en la carpeta de Drive configurada, lo descarga y devuelve
+    (DataFrame de la tabla de energía, metadata del archivo) o (None, None) si no existe.
+    El parámetro _cache_bust permite forzar una recarga manual (botón "Recargar").
+    """
+    archivo = buscar_archivo_en_drive(NOMBRE_ARCHIVO_ENERGIA_DB, CARPETA_ENERGIA_DRIVE_ID)
+    if archivo is None:
+        return None, None, "no_encontrado", []
+
+    contenido = _descargar_bytes_drive(archivo['id'])
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+            tmp.write(contenido)
+            tmp_path = tmp.name
+
+        conn = sqlite3.connect(tmp_path)
+        try:
+            tablas = pd.read_sql(
+                "SELECT name FROM sqlite_master WHERE type='table'", conn
+            )['name'].tolist()
+
+            if not tablas:
+                return None, archivo, "sin_tablas", []
+
+            tabla_a_usar = TABLA_ENERGIA_PREFERIDA if TABLA_ENERGIA_PREFERIDA in tablas else tablas[0]
+            df = pd.read_sql(f"SELECT * FROM {tabla_a_usar}", conn)
+            return df, archivo, tabla_a_usar, tablas
+        finally:
+            conn.close()
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def estandarizar_columnas_energia(df_crudo):
+    """
+    Renombra las columnas de energia.db a los nombres internos que usa el motor SEC
+    (Timestamp, ID_Maquina_Texto, Energia_kWh, Potencia_kW), tolerando variantes de
+    nombre según ALIAS_COLUMNAS_ENERGIA. Devuelve (df_renombrado, columnas_faltantes).
+    """
+    df = df_crudo.copy()
+    df.columns = df.columns.str.strip()
+    mapa_renombre = {}
+    faltantes = []
+
+    for nombre_interno, alias in ALIAS_COLUMNAS_ENERGIA.items():
+        encontrado = next((a for a in alias if a in df.columns), None)
+        if encontrado:
+            mapa_renombre[encontrado] = nombre_interno
+        else:
+            faltantes.append(nombre_interno)
+
+    df.rename(columns=mapa_renombre, inplace=True)
+    return df, faltantes
 
 
 # ==========================================
@@ -275,255 +393,281 @@ st.success(f"Datos base descargados: {len(df_prod_raw)} OTs de Producción, {len
            f"y {len(df_costo_raw)} referencias de Costo Estándar.")
 
 # ==========================================
-# 2. CARGA DE ENERGÍA
+# 2. CONSUMO ENERGÉTICO — AHORA DESDE energia.db EN DRIVE (sin CSV manual)
 # ==========================================
-st.markdown("### 2. Carga de Consumo Energético")
-uploaded_energia = st.file_uploader("Sube tu reporte CSV de energía (Ej. Consumo_1Ene_A_1Jun_2026.csv):", type=["csv"])
+st.markdown("### 2. Consumo Energético (energia.db en Drive)")
 
-if uploaded_energia is not None:
-    if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
-        with st.status("Procesando Motor SEC...", expanded=True) as status:
-            try:
-                # --- PREPARAR PRODUCCIÓN ---
-                st.write("⚙️ Estandarizando Producción...")
-                df_prod = df_prod_raw.copy()
-                df_prod.rename(columns={
-                    'Máquina': 'ID_Maquina', 'Trabajo / Orden': 'ID_Job',
-                    'Tiempo Empezar': 'Inicio', 'Tiempo Final': 'Fin',
-                    'Número de Parte': 'ID_Parte'
-                }, inplace=True)
-                df_prod['ID_Job'] = df_prod['ID_Job'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-                df_prod['ID_Parte'] = df_prod['ID_Parte'].astype(str).str.strip()
+col_refresh, col_info = st.columns([1, 4])
+with col_refresh:
+    forzar_recarga = st.button("🔄 Recargar energia.db")
 
-                df_prod['Inicio_Limpio'] = pd.to_datetime(df_prod['Inicio'], errors='coerce', format='mixed', dayfirst=True)
-                # Esto también captura los 'Current' (OTs aún en curso, sin fecha de fin real)
-                df_prod['Fin_Limpio'] = pd.to_datetime(df_prod['Fin'], errors='coerce', format='mixed', dayfirst=True)
-                n_prod_antes = len(df_prod)
-                n_en_curso = (df_prod['Fin'].astype(str).str.strip().str.lower() == 'current').sum()
-                df_prod = df_prod.dropna(subset=['Inicio_Limpio', 'Fin_Limpio'])
-                n_prod_sin_fecha = n_prod_antes - len(df_prod)
+if forzar_recarga:
+    descargar_energia_db.clear()
 
-                duplicados_prod = df_prod['ID_Job'][df_prod['ID_Job'].duplicated(keep=False)].unique().tolist()
-                df_prod['ID_Maquina_Normalizado'] = df_prod['ID_Maquina'].apply(normalizar_maquina)
+with st.spinner(f"Buscando '{NOMBRE_ARCHIVO_ENERGIA_DB}' en la carpeta de Drive..."):
+    # el segundo argumento solo se usa para invalidar el cache cuando se pulsa "Recargar"
+    df_energia_bruto, meta_archivo, tabla_usada, tablas_disponibles = descargar_energia_db(
+        _cache_bust=dt.datetime.now().isoformat() if forzar_recarga else None
+    )
 
-                # --- VALIDACIÓN DE VENTANA DE TIEMPO CONFIABLE ---
-                st.write("🕵️ Validando ventanas de tiempo (calendario vs. tiempo real de la OT)...")
-                df_prod['Activo_Min'] = df_prod['Tiempo de Actividad'].apply(parsear_duracion_minutos)
-                df_prod['Inactivo_Min'] = df_prod['Tiempo de Inactividad'].apply(parsear_duracion_minutos)
-                df_prod['Duracion_Calendario_Min'] = (df_prod['Fin_Limpio'] - df_prod['Inicio_Limpio']).dt.total_seconds() / 60.0
-                df_prod['Duracion_Real_Min'] = df_prod['Activo_Min'] + df_prod['Inactivo_Min']
+if df_energia_bruto is None:
+    if tabla_usada == "no_encontrado":
+        st.error(f"❌ No se encontró un archivo llamado **{NOMBRE_ARCHIVO_ENERGIA_DB}** en la carpeta de Drive "
+                 f"configurada (ID `{CARPETA_ENERGIA_DRIVE_ID}`). Verifica que exista y que la cuenta de servicio "
+                 f"tenga acceso de Lector/Editor a esa carpeta.")
+    else:
+        st.error(f"❌ Se encontró y descargó **{NOMBRE_ARCHIVO_ENERGIA_DB}**, pero no tiene tablas legibles.")
+    st.stop()
 
-                tiene_tiempos = df_prod['Duracion_Real_Min'].notna()
-                diferencia_min = (df_prod['Duracion_Calendario_Min'] - df_prod['Duracion_Real_Min']).abs()
-                umbral_min = np.maximum(UMBRAL_VENTANA_MIN_HORAS * 60, UMBRAL_VENTANA_PCT * df_prod['Duracion_Calendario_Min'])
-                df_prod['Ventana_Confiable'] = tiene_tiempos & (diferencia_min <= umbral_min)
-                df_prod['Diferencia_Ventana_Min'] = np.where(tiene_tiempos, diferencia_min, np.nan)
+df_energia, columnas_faltantes = estandarizar_columnas_energia(df_energia_bruto)
 
-                n_ventana_no_confiable = int((~df_prod['Ventana_Confiable']).sum())
+if columnas_faltantes:
+    st.error(f"❌ La tabla `{tabla_usada}` de energia.db no tiene (ni con alias conocidos) estas columnas: "
+             f"{columnas_faltantes}. Columnas reales encontradas: {list(df_energia_bruto.columns)}. "
+             f"Ajusta `ALIAS_COLUMNAS_ENERGIA` o `TABLA_ENERGIA_PREFERIDA` en el código con el nombre correcto.")
+    if len(tablas_disponibles) > 1:
+        st.info(f"Otras tablas disponibles en el archivo: {tablas_disponibles}")
+    st.stop()
 
-                # --- PREPARAR MASAS: clasificación por unidad ---
-                st.write("⚖️ Clasificando y consolidando Masas por ID_Job (filtrando por unidad)...")
-                df_masas = df_masas_raw.copy()
-                df_masas['ID_Job'] = df_masas['ID_Job'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-                df_masas['Total'] = df_masas['Total'].astype(str).str.replace(',', '.', regex=False)
-                df_masas['Total'] = pd.to_numeric(df_masas['Total'], errors='coerce')
+with col_info:
+    fecha_mod = meta_archivo.get('modifiedTime', 'desconocida') if meta_archivo else 'desconocida'
+    st.success(f"✅ **{NOMBRE_ARCHIVO_ENERGIA_DB}** cargado desde Drive (tabla `{tabla_usada}`, {len(df_energia):,} registros). "
+               f"Última modificación en Drive: {fecha_mod}.")
 
-                clasificacion = df_masas.apply(
-                    lambda row: clasificar_unidad_masa(row['Descripcion'], row['Total']), axis=1
-                )
-                df_masas['Unidad_Detectada'] = [c[0] for c in clasificacion]
-                df_masas['Valor_Kg_Equivalente'] = [c[1] for c in clasificacion]
-                df_masas['Incluido_En_Calculo'] = [c[2] for c in clasificacion]
+if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
+    with st.status("Procesando Motor SEC...", expanded=True) as status:
+        try:
+            # --- PREPARAR PRODUCCIÓN ---
+            st.write("⚙️ Estandarizando Producción...")
+            df_prod = df_prod_raw.copy()
+            df_prod.rename(columns={
+                'Máquina': 'ID_Maquina', 'Trabajo / Orden': 'ID_Job',
+                'Tiempo Empezar': 'Inicio', 'Tiempo Final': 'Fin',
+                'Número de Parte': 'ID_Parte'
+            }, inplace=True)
+            df_prod['ID_Job'] = df_prod['ID_Job'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+            df_prod['ID_Parte'] = df_prod['ID_Parte'].astype(str).str.strip()
 
-                n_excluidas = int((~df_masas['Incluido_En_Calculo']).sum())
-                resumen_exclusion = df_masas.loc[~df_masas['Incluido_En_Calculo'], 'Unidad_Detectada'].value_counts()
+            df_prod['Inicio_Limpio'] = pd.to_datetime(df_prod['Inicio'], errors='coerce', format='mixed', dayfirst=True)
+            # Esto también captura los 'Current' (OTs aún en curso, sin fecha de fin real)
+            df_prod['Fin_Limpio'] = pd.to_datetime(df_prod['Fin'], errors='coerce', format='mixed', dayfirst=True)
+            n_prod_antes = len(df_prod)
+            n_en_curso = (df_prod['Fin'].astype(str).str.strip().str.lower() == 'current').sum()
+            df_prod = df_prod.dropna(subset=['Inicio_Limpio', 'Fin_Limpio'])
+            n_prod_sin_fecha = n_prod_antes - len(df_prod)
 
-                df_masas_incluidas = df_masas[df_masas['Incluido_En_Calculo']]
-                df_masas_agg = df_masas_incluidas.groupby('ID_Job', as_index=False)['Valor_Kg_Equivalente'].sum()
-                df_masas_agg.rename(columns={'Valor_Kg_Equivalente': 'Total_Masa_Kg'}, inplace=True)
+            duplicados_prod = df_prod['ID_Job'][df_prod['ID_Job'].duplicated(keep=False)].unique().tolist()
+            df_prod['ID_Maquina_Normalizado'] = df_prod['ID_Maquina'].apply(normalizar_maquina)
 
-                # --- PREPARAR COSTO ESTÁNDAR ---
-                st.write("💲 Preparando Costo Estándar por referencia (Item = Número de Parte)...")
-                df_costo = df_costo_raw.copy()
-                df_costo['ID_Parte'] = df_costo['Item'].astype(str).str.strip()
-                df_costo['Costo_Unitario_Estandar'] = pd.to_numeric(df_costo['costo estandar'], errors='coerce')
-                df_costo_dedup = df_costo.drop_duplicates(subset='ID_Parte', keep='first')
-                cols_costo_extra = [c for c in ['Materiales', 'Recursos', 'CIF', 'Proceso Externo'] if c in df_costo_dedup.columns]
-                df_costo_final = df_costo_dedup[['ID_Parte', 'Costo_Unitario_Estandar'] + cols_costo_extra]
+            # --- VALIDACIÓN DE VENTANA DE TIEMPO CONFIABLE ---
+            st.write("🕵️ Validando ventanas de tiempo (calendario vs. tiempo real de la OT)...")
+            df_prod['Activo_Min'] = df_prod['Tiempo de Actividad'].apply(parsear_duracion_minutos)
+            df_prod['Inactivo_Min'] = df_prod['Tiempo de Inactividad'].apply(parsear_duracion_minutos)
+            df_prod['Duracion_Calendario_Min'] = (df_prod['Fin_Limpio'] - df_prod['Inicio_Limpio']).dt.total_seconds() / 60.0
+            df_prod['Duracion_Real_Min'] = df_prod['Activo_Min'] + df_prod['Inactivo_Min']
 
-                if n_excluidas > 0:
-                    st.info(f"ℹ️ Se excluyeron {n_excluidas} filas de '{hoja_masas_elegida}' que no representan masa "
-                            f"(unidades tipo UN/empaque o desconocidas). Detalle: {resumen_exclusion.to_dict()}.")
-                if n_prod_sin_fecha > 0:
-                    st.info(f"ℹ️ Se descartaron {n_prod_sin_fecha} filas de Producción sin fecha válida "
-                            f"(incluye {n_en_curso} OTs aún en curso marcadas como 'Current').")
-                if duplicados_prod:
-                    st.warning(f"⚠️ {len(duplicados_prod)} ID_Job aparecen más de una vez en '{hoja_prod_elegida}' "
-                               f"(ej. {duplicados_prod[:5]}...).")
-                if n_ventana_no_confiable > 0:
-                    st.warning(f"⚠️ {n_ventana_no_confiable} OTs tienen una diferencia grande entre el tiempo calendario "
-                               f"(Fin−Inicio) y su tiempo real (Actividad+Inactividad) — probablemente la máquina corrió "
-                               f"otras órdenes en el medio. **Se excluyen del cruce de energía** para no contaminar el "
-                               f"cálculo de otras OTs (umbral: {UMBRAL_VENTANA_MIN_HORAS}h o {UMBRAL_VENTANA_PCT*100:.0f}% "
-                               f"de la duración, lo que sea mayor).")
+            tiene_tiempos = df_prod['Duracion_Real_Min'].notna()
+            diferencia_min = (df_prod['Duracion_Calendario_Min'] - df_prod['Duracion_Real_Min']).abs()
+            umbral_min = np.maximum(UMBRAL_VENTANA_MIN_HORAS * 60, UMBRAL_VENTANA_PCT * df_prod['Duracion_Calendario_Min'])
+            df_prod['Ventana_Confiable'] = tiene_tiempos & (diferencia_min <= umbral_min)
+            df_prod['Diferencia_Ventana_Min'] = np.where(tiene_tiempos, diferencia_min, np.nan)
 
-                # --- MERGE PRODUCCIÓN + MASAS + COSTO ---
-                st.write("🔗 Uniendo Producción, Masas y Costo Estándar...")
-                df_consolidado = pd.merge(df_prod, df_masas_agg, on='ID_Job', how='inner')
-                df_consolidado = pd.merge(df_consolidado, df_costo_final, on='ID_Parte', how='left')
+            n_ventana_no_confiable = int((~df_prod['Ventana_Confiable']).sum())
 
-                n_prod_sin_masa = df_prod['ID_Job'].nunique() - df_consolidado['ID_Job'].nunique()
-                n_sin_costo = df_consolidado['Costo_Unitario_Estandar'].isna().sum()
+            # --- PREPARAR MASAS: clasificación por unidad ---
+            st.write("⚖️ Clasificando y consolidando Masas por ID_Job (filtrando por unidad)...")
+            df_masas = df_masas_raw.copy()
+            df_masas['ID_Job'] = df_masas['ID_Job'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+            df_masas['Total'] = df_masas['Total'].astype(str).str.replace(',', '.', regex=False)
+            df_masas['Total'] = pd.to_numeric(df_masas['Total'], errors='coerce')
 
-                if df_consolidado.empty:
-                    st.warning("⚠️ El cruce Producción↔Masas dio 0 filas. Revisa que los ID_Job coincidan en formato.")
+            clasificacion = df_masas.apply(
+                lambda row: clasificar_unidad_masa(row['Descripcion'], row['Total']), axis=1
+            )
+            df_masas['Unidad_Detectada'] = [c[0] for c in clasificacion]
+            df_masas['Valor_Kg_Equivalente'] = [c[1] for c in clasificacion]
+            df_masas['Incluido_En_Calculo'] = [c[2] for c in clasificacion]
+
+            n_excluidas = int((~df_masas['Incluido_En_Calculo']).sum())
+            resumen_exclusion = df_masas.loc[~df_masas['Incluido_En_Calculo'], 'Unidad_Detectada'].value_counts()
+
+            df_masas_incluidas = df_masas[df_masas['Incluido_En_Calculo']]
+            df_masas_agg = df_masas_incluidas.groupby('ID_Job', as_index=False)['Valor_Kg_Equivalente'].sum()
+            df_masas_agg.rename(columns={'Valor_Kg_Equivalente': 'Total_Masa_Kg'}, inplace=True)
+
+            # --- PREPARAR COSTO ESTÁNDAR ---
+            st.write("💲 Preparando Costo Estándar por referencia (Item = Número de Parte)...")
+            df_costo = df_costo_raw.copy()
+            df_costo['ID_Parte'] = df_costo['Item'].astype(str).str.strip()
+            df_costo['Costo_Unitario_Estandar'] = pd.to_numeric(df_costo['costo estandar'], errors='coerce')
+            df_costo_dedup = df_costo.drop_duplicates(subset='ID_Parte', keep='first')
+            cols_costo_extra = [c for c in ['Materiales', 'Recursos', 'CIF', 'Proceso Externo'] if c in df_costo_dedup.columns]
+            df_costo_final = df_costo_dedup[['ID_Parte', 'Costo_Unitario_Estandar'] + cols_costo_extra]
+
+            if n_excluidas > 0:
+                st.info(f"ℹ️ Se excluyeron {n_excluidas} filas de '{hoja_masas_elegida}' que no representan masa "
+                        f"(unidades tipo UN/empaque o desconocidas). Detalle: {resumen_exclusion.to_dict()}.")
+            if n_prod_sin_fecha > 0:
+                st.info(f"ℹ️ Se descartaron {n_prod_sin_fecha} filas de Producción sin fecha válida "
+                        f"(incluye {n_en_curso} OTs aún en curso marcadas como 'Current').")
+            if duplicados_prod:
+                st.warning(f"⚠️ {len(duplicados_prod)} ID_Job aparecen más de una vez en '{hoja_prod_elegida}' "
+                           f"(ej. {duplicados_prod[:5]}...).")
+            if n_ventana_no_confiable > 0:
+                st.warning(f"⚠️ {n_ventana_no_confiable} OTs tienen una diferencia grande entre el tiempo calendario "
+                           f"(Fin−Inicio) y su tiempo real (Actividad+Inactividad) — probablemente la máquina corrió "
+                           f"otras órdenes en el medio. **Se excluyen del cruce de energía** para no contaminar el "
+                           f"cálculo de otras OTs (umbral: {UMBRAL_VENTANA_MIN_HORAS}h o {UMBRAL_VENTANA_PCT*100:.0f}% "
+                           f"de la duración, lo que sea mayor).")
+
+            # --- MERGE PRODUCCIÓN + MASAS + COSTO ---
+            st.write("🔗 Uniendo Producción, Masas y Costo Estándar...")
+            df_consolidado = pd.merge(df_prod, df_masas_agg, on='ID_Job', how='inner')
+            df_consolidado = pd.merge(df_consolidado, df_costo_final, on='ID_Parte', how='left')
+
+            n_prod_sin_masa = df_prod['ID_Job'].nunique() - df_consolidado['ID_Job'].nunique()
+            n_sin_costo = df_consolidado['Costo_Unitario_Estandar'].isna().sum()
+
+            if df_consolidado.empty:
+                st.warning("⚠️ El cruce Producción↔Masas dio 0 filas. Revisa que los ID_Job coincidan en formato.")
+            else:
+                if n_prod_sin_masa > 0:
+                    st.info(f"ℹ️ {n_prod_sin_masa} órdenes de Producción no encontraron masa asociada y quedaron fuera del cruce.")
+                if n_sin_costo > 0:
+                    st.warning(f"⚠️ {n_sin_costo} OTs no encontraron costo estándar para su Número de Parte — "
+                               f"su costo de no conformidad quedará en blanco.")
+
+            # --- VALIDACIÓN: Producción Total debe cuadrar con Buena + Rechazo ---
+            for col in ['Producción Total', 'Producción Buena', 'Producción de Rechazo']:
+                df_consolidado[col] = pd.to_numeric(df_consolidado[col], errors='coerce').fillna(0)
+            diff_prod = (df_consolidado['Producción Total'] -
+                         (df_consolidado['Producción Buena'] + df_consolidado['Producción de Rechazo'])).abs()
+            tol_prod = np.maximum(1, 0.01 * df_consolidado['Producción Total'])
+            df_consolidado['Produccion_Cuadra'] = diff_prod <= tol_prod
+            n_prod_no_cuadra = int((~df_consolidado['Produccion_Cuadra']).sum())
+            if n_prod_no_cuadra > 0:
+                st.warning(f"⚠️ {n_prod_no_cuadra} OTs tienen 'Producción Total' que no coincide con "
+                           f"'Buena + Rechazo' — revisar en el Inspector de Orden (columna 'Produccion_Cuadra').")
+
+            # --- DETECCIÓN DE SOLAPES DE VENTANA DE ENERGÍA ---
+            st.write("🕒 Revisando solapes de ventana temporal entre OTs de la misma máquina...")
+            df_consolidado = df_consolidado.sort_values(['ID_Maquina_Normalizado', 'Inicio_Limpio']).reset_index(drop=True)
+            df_consolidado['Inicio_Span'] = df_consolidado['Inicio_Limpio'] - pd.Timedelta(minutes=TOLERANCIA_MINUTOS)
+            df_consolidado['Fin_Span'] = df_consolidado['Fin_Limpio'] + pd.Timedelta(minutes=TOLERANCIA_MINUTOS)
+            fin_span_prev = df_consolidado.groupby('ID_Maquina_Normalizado')['Fin_Span'].shift(1)
+            maquina_prev = df_consolidado.groupby('ID_Maquina_Normalizado')['ID_Maquina_Normalizado'].shift(1)
+            df_consolidado['Solape_Ventana_Energia'] = (
+                (df_consolidado['ID_Maquina_Normalizado'] == maquina_prev) &
+                (df_consolidado['Inicio_Span'] < fin_span_prev)
+            )
+            n_solapes = int(df_consolidado['Solape_Ventana_Energia'].sum())
+            if n_solapes > 0:
+                st.warning(f"⚠️ {n_solapes} OTs tienen su ventana de ±{TOLERANCIA_MINUTOS} min traslapada con la OT "
+                           f"anterior de la misma máquina — posible doble conteo de energía.")
+
+            # --- PREPARAR ENERGÍA (ya viene de energia.db, descargado arriba) ---
+            st.write(f"⚡ Preparando datos de Energía desde energia.db (tabla `{tabla_usada}`)...")
+            df_energia_prep = df_energia.copy()
+
+            df_energia_prep['Timestamp'] = pd.to_datetime(
+                df_energia_prep['Timestamp'].astype(str), format='mixed', errors='coerce'
+            ).dt.floor('min')
+            df_energia_prep.dropna(subset=['Timestamp', 'Energia_kWh'], inplace=True)
+            df_energia_prep['Energia_kWh'] = pd.to_numeric(df_energia_prep['Energia_kWh'], errors='coerce')
+            df_energia_prep['Potencia_kW'] = pd.to_numeric(df_energia_prep['Potencia_kW'], errors='coerce')
+            df_energia_prep['ID_Maquina_Texto'] = df_energia_prep['ID_Maquina_Texto'].astype(str).str.strip().str.upper()
+
+            maquinas_prod = set(df_consolidado['ID_Maquina_Normalizado'].dropna().unique())
+            maquinas_nrg = set(df_energia_prep['ID_Maquina_Texto'].dropna().unique())
+            maquinas_sin_energia = sorted(maquinas_prod - maquinas_nrg)
+            if maquinas_sin_energia:
+                st.warning(f"⚠️ Estas máquinas de Producción no aparecen (con ese nombre exacto) en energia.db: "
+                           f"{maquinas_sin_energia}. Todas sus OTs quedarán con 'Sin datos'.")
+
+            # --- CRUCE FINAL (MOTOR SEC) ---
+            st.write(f"🧠 Ejecutando emparejamiento con tolerancia temporal (±{TOLERANCIA_MINUTOS} min)...")
+            resultados_sec = []
+
+            for _, ot in df_consolidado.iterrows():
+                maquina_ot = ot['ID_Maquina_Normalizado']
+                inicio_real = ot['Inicio_Limpio']
+                fin_real = ot['Fin_Limpio']
+
+                if pd.isna(inicio_real) or pd.isna(fin_real):
+                    continue
+
+                ventana_confiable = bool(ot['Ventana_Confiable'])
+
+                if ventana_confiable:
+                    energia_ot, _, _ = buscar_energia_ot(df_energia_prep, maquina_ot, inicio_real, fin_real)
                 else:
-                    if n_prod_sin_masa > 0:
-                        st.info(f"ℹ️ {n_prod_sin_masa} órdenes de Producción no encontraron masa asociada y quedaron fuera del cruce.")
-                    if n_sin_costo > 0:
-                        st.warning(f"⚠️ {n_sin_costo} OTs no encontraron costo estándar para su Número de Parte — "
-                                   f"su costo de no conformidad quedará en blanco.")
+                    # No confiamos en el rango calendario: no buscamos energía para no
+                    # atribuirle a esta OT el consumo de otras órdenes intermedias.
+                    energia_ot = df_energia_prep.iloc[0:0]
 
-                # --- VALIDACIÓN: Producción Total debe cuadrar con Buena + Rechazo ---
-                for col in ['Producción Total', 'Producción Buena', 'Producción de Rechazo']:
-                    df_consolidado[col] = pd.to_numeric(df_consolidado[col], errors='coerce').fillna(0)
-                diff_prod = (df_consolidado['Producción Total'] -
-                             (df_consolidado['Producción Buena'] + df_consolidado['Producción de Rechazo'])).abs()
-                tol_prod = np.maximum(1, 0.01 * df_consolidado['Producción Total'])
-                df_consolidado['Produccion_Cuadra'] = diff_prod <= tol_prod
-                n_prod_no_cuadra = int((~df_consolidado['Produccion_Cuadra']).sum())
-                if n_prod_no_cuadra > 0:
-                    st.warning(f"⚠️ {n_prod_no_cuadra} OTs tienen 'Producción Total' que no coincide con "
-                               f"'Buena + Rechazo' — revisar en el Inspector de Orden (columna 'Produccion_Cuadra').")
+                metricas = calcular_metricas_ot(energia_ot, inicio_real, fin_real)
+                if not ventana_confiable:
+                    metricas['Confiabilidad'] = 'Sin Ventana Confiable'
 
-                # --- DETECCIÓN DE SOLAPES DE VENTANA DE ENERGÍA ---
-                st.write("🕒 Revisando solapes de ventana temporal entre OTs de la misma máquina...")
-                df_consolidado = df_consolidado.sort_values(['ID_Maquina_Normalizado', 'Inicio_Limpio']).reset_index(drop=True)
-                df_consolidado['Inicio_Span'] = df_consolidado['Inicio_Limpio'] - pd.Timedelta(minutes=TOLERANCIA_MINUTOS)
-                df_consolidado['Fin_Span'] = df_consolidado['Fin_Limpio'] + pd.Timedelta(minutes=TOLERANCIA_MINUTOS)
-                fin_span_prev = df_consolidado.groupby('ID_Maquina_Normalizado')['Fin_Span'].shift(1)
-                maquina_prev = df_consolidado.groupby('ID_Maquina_Normalizado')['ID_Maquina_Normalizado'].shift(1)
-                df_consolidado['Solape_Ventana_Energia'] = (
-                    (df_consolidado['ID_Maquina_Normalizado'] == maquina_prev) &
-                    (df_consolidado['Inicio_Span'] < fin_span_prev)
-                )
-                n_solapes = int(df_consolidado['Solape_Ventana_Energia'].sum())
-                if n_solapes > 0:
-                    st.warning(f"⚠️ {n_solapes} OTs tienen su ventana de ±{TOLERANCIA_MINUTOS} min traslapada con la OT "
-                               f"anterior de la misma máquina — posible doble conteo de energía.")
+                masa_total_kg = ot['Total_Masa_Kg'] if pd.notna(ot['Total_Masa_Kg']) else np.nan
+                prod_total = ot['Producción Total']
+                prod_buena = ot['Producción Buena']
+                prod_rechazo = ot['Producción de Rechazo']
+                costo_unitario = ot['Costo_Unitario_Estandar'] if pd.notna(ot.get('Costo_Unitario_Estandar', np.nan)) else np.nan
 
-                # --- PREPARAR ENERGÍA ---
-                st.write("⚡ Analizando CSV de Energía...")
-                content_energia = uploaded_energia.read()
-                df_energia = pd.read_csv(io.BytesIO(content_energia), encoding='utf-8', encoding_errors='replace')
-                df_energia.columns = df_energia.columns.str.strip()
+                masa_buena_kg = (masa_total_kg * (prod_buena / prod_total)
+                                  if (pd.notna(masa_total_kg) and prod_total > 0) else np.nan)
 
-                renombres_nrg = {'Fecha y hora': 'Timestamp', 'maquina_o_puesto': 'ID_Maquina_Texto', 'Energía [kWh]': 'Energia_kWh', 'Potencia [kW]': 'Potencia_kW'}
-                df_energia.rename(columns={k: v for k, v in renombres_nrg.items() if k in df_energia.columns}, inplace=True)
+                energia_total = metricas['Energia_Total_kWh']
+                activo_min = ot['Activo_Min']
+                inactivo_min = ot['Inactivo_Min']
+                duracion_real_min = ot['Duracion_Real_Min']
 
-                columnas_energia_requeridas = {'Timestamp', 'ID_Maquina_Texto', 'Energia_kWh', 'Potencia_kW'}
-                faltantes_nrg = columnas_energia_requeridas - set(df_energia.columns)
-                if faltantes_nrg:
-                    raise ValueError(f"El CSV de energía no tiene las columnas esperadas: {faltantes_nrg}. "
-                                      f"Columnas encontradas: {list(df_energia.columns)}")
+                if ventana_confiable and pd.notna(duracion_real_min) and duracion_real_min > 0:
+                    energia_activa_kwh = energia_total * (activo_min / duracion_real_min)
+                    energia_parada_kwh = energia_total * (inactivo_min / duracion_real_min)
+                    parada_pct = (inactivo_min / duracion_real_min) * 100
+                else:
+                    energia_activa_kwh = np.nan
+                    energia_parada_kwh = np.nan
+                    parada_pct = np.nan
 
-                df_energia['Timestamp'] = pd.to_datetime(df_energia['Timestamp'].astype(str), format='mixed', errors='coerce').dt.floor('min')
-                df_energia.dropna(subset=['Timestamp', 'Energia_kWh'], inplace=True)
-                df_energia['Energia_kWh'] = pd.to_numeric(df_energia['Energia_kWh'], errors='coerce')
-                df_energia['Potencia_kW'] = pd.to_numeric(df_energia['Potencia_kW'], errors='coerce')
-                df_energia['ID_Maquina_Texto'] = df_energia['ID_Maquina_Texto'].astype(str).str.strip().str.upper()
+                sec_total = (round(energia_total / masa_total_kg, 4)
+                             if (ventana_confiable and pd.notna(masa_total_kg) and masa_total_kg > 0) else np.nan)
+                sec_inyeccion = (round(energia_activa_kwh / masa_total_kg, 4)
+                                  if (pd.notna(energia_activa_kwh) and pd.notna(masa_total_kg) and masa_total_kg > 0) else np.nan)
+                sec_conforme = (round(energia_total / masa_buena_kg, 4)
+                                 if (ventana_confiable and pd.notna(masa_buena_kg) and masa_buena_kg > 0) else np.nan)
 
-                maquinas_prod = set(df_consolidado['ID_Maquina_Normalizado'].dropna().unique())
-                maquinas_nrg = set(df_energia['ID_Maquina_Texto'].dropna().unique())
-                maquinas_sin_energia = sorted(maquinas_prod - maquinas_nrg)
-                if maquinas_sin_energia:
-                    st.warning(f"⚠️ Estas máquinas de Producción no aparecen (con ese nombre exacto) en el CSV de energía: "
-                               f"{maquinas_sin_energia}. Todas sus OTs quedarán con 'Sin datos'.")
+                costo_no_conformidad = round(prod_rechazo * costo_unitario, 0) if pd.notna(costo_unitario) else np.nan
+                energia_desperdiciada_rechazo = (round(energia_total * (prod_rechazo / prod_total), 4)
+                                                   if (ventana_confiable and prod_total > 0) else np.nan)
 
-                # --- CRUCE FINAL (MOTOR SEC) ---
-                st.write(f"🧠 Ejecutando emparejamiento con tolerancia temporal (±{TOLERANCIA_MINUTOS} min)...")
-                resultados_sec = []
+                fila_resultado = ot.to_dict()
+                fila_resultado.update(metricas)
+                fila_resultado['Masa_Buena_Kg'] = round(masa_buena_kg, 3) if pd.notna(masa_buena_kg) else np.nan
+                fila_resultado['Energia_Activa_Estimada_kWh'] = round(energia_activa_kwh, 3) if pd.notna(energia_activa_kwh) else np.nan
+                fila_resultado['Energia_Parada_Estimada_kWh'] = round(energia_parada_kwh, 3) if pd.notna(energia_parada_kwh) else np.nan
+                fila_resultado['Energia_Parada_Pct'] = round(parada_pct, 1) if pd.notna(parada_pct) else np.nan
+                fila_resultado['SEC_Total_kWh_kg'] = sec_total
+                fila_resultado['SEC_Inyeccion_kWh_kg'] = sec_inyeccion
+                fila_resultado['SEC_Conforme_kWh_kg'] = sec_conforme
+                fila_resultado['Costo_No_Conformidad'] = costo_no_conformidad
+                fila_resultado['Energia_Desperdiciada_Rechazo_kWh'] = energia_desperdiciada_rechazo
+                resultados_sec.append(fila_resultado)
 
-                for _, ot in df_consolidado.iterrows():
-                    maquina_ot = ot['ID_Maquina_Normalizado']
-                    inicio_real = ot['Inicio_Limpio']
-                    fin_real = ot['Fin_Limpio']
+            df_resultado_final = pd.DataFrame(resultados_sec)
 
-                    if pd.isna(inicio_real) or pd.isna(fin_real):
-                        continue
+            status.update(label="¡Cálculo SEC completado exitosamente!", state="complete", expanded=False)
+            st.session_state['df_sec_calculado'] = df_resultado_final
+            st.session_state['df_prod_std'] = df_prod
+            st.session_state['df_masas_std'] = df_masas
+            st.session_state['df_energia_std'] = df_energia_prep
+            st.balloons()
 
-                    ventana_confiable = bool(ot['Ventana_Confiable'])
-
-                    if ventana_confiable:
-                        energia_ot, _, _ = buscar_energia_ot(df_energia, maquina_ot, inicio_real, fin_real)
-                    else:
-                        # No confiamos en el rango calendario: no buscamos energía para no
-                        # atribuirle a esta OT el consumo de otras órdenes intermedias.
-                        energia_ot = df_energia.iloc[0:0]
-
-                    metricas = calcular_metricas_ot(energia_ot, inicio_real, fin_real)
-                    if not ventana_confiable:
-                        metricas['Confiabilidad'] = 'Sin Ventana Confiable'
-
-                    masa_total_kg = ot['Total_Masa_Kg'] if pd.notna(ot['Total_Masa_Kg']) else np.nan
-                    prod_total = ot['Producción Total']
-                    prod_buena = ot['Producción Buena']
-                    prod_rechazo = ot['Producción de Rechazo']
-                    costo_unitario = ot['Costo_Unitario_Estandar'] if pd.notna(ot.get('Costo_Unitario_Estandar', np.nan)) else np.nan
-
-                    masa_buena_kg = (masa_total_kg * (prod_buena / prod_total)
-                                      if (pd.notna(masa_total_kg) and prod_total > 0) else np.nan)
-
-                    energia_total = metricas['Energia_Total_kWh']
-                    activo_min = ot['Activo_Min']
-                    inactivo_min = ot['Inactivo_Min']
-                    duracion_real_min = ot['Duracion_Real_Min']
-
-                    if ventana_confiable and pd.notna(duracion_real_min) and duracion_real_min > 0:
-                        energia_activa_kwh = energia_total * (activo_min / duracion_real_min)
-                        energia_parada_kwh = energia_total * (inactivo_min / duracion_real_min)
-                        parada_pct = (inactivo_min / duracion_real_min) * 100
-                    else:
-                        energia_activa_kwh = np.nan
-                        energia_parada_kwh = np.nan
-                        parada_pct = np.nan
-
-                    sec_total = (round(energia_total / masa_total_kg, 4)
-                                 if (ventana_confiable and pd.notna(masa_total_kg) and masa_total_kg > 0) else np.nan)
-                    sec_inyeccion = (round(energia_activa_kwh / masa_total_kg, 4)
-                                      if (pd.notna(energia_activa_kwh) and pd.notna(masa_total_kg) and masa_total_kg > 0) else np.nan)
-                    sec_conforme = (round(energia_total / masa_buena_kg, 4)
-                                     if (ventana_confiable and pd.notna(masa_buena_kg) and masa_buena_kg > 0) else np.nan)
-
-                    costo_no_conformidad = round(prod_rechazo * costo_unitario, 0) if pd.notna(costo_unitario) else np.nan
-                    energia_desperdiciada_rechazo = (round(energia_total * (prod_rechazo / prod_total), 4)
-                                                       if (ventana_confiable and prod_total > 0) else np.nan)
-
-                    fila_resultado = ot.to_dict()
-                    fila_resultado.update(metricas)
-                    fila_resultado['Masa_Buena_Kg'] = round(masa_buena_kg, 3) if pd.notna(masa_buena_kg) else np.nan
-                    fila_resultado['Energia_Activa_Estimada_kWh'] = round(energia_activa_kwh, 3) if pd.notna(energia_activa_kwh) else np.nan
-                    fila_resultado['Energia_Parada_Estimada_kWh'] = round(energia_parada_kwh, 3) if pd.notna(energia_parada_kwh) else np.nan
-                    fila_resultado['Energia_Parada_Pct'] = round(parada_pct, 1) if pd.notna(parada_pct) else np.nan
-                    fila_resultado['SEC_Total_kWh_kg'] = sec_total
-                    fila_resultado['SEC_Inyeccion_kWh_kg'] = sec_inyeccion
-                    fila_resultado['SEC_Conforme_kWh_kg'] = sec_conforme
-                    fila_resultado['Costo_No_Conformidad'] = costo_no_conformidad
-                    fila_resultado['Energia_Desperdiciada_Rechazo_kWh'] = energia_desperdiciada_rechazo
-                    resultados_sec.append(fila_resultado)
-
-                df_resultado_final = pd.DataFrame(resultados_sec)
-
-                status.update(label="¡Cálculo SEC completado exitosamente!", state="complete", expanded=False)
-                st.session_state['df_sec_calculado'] = df_resultado_final
-                st.session_state['df_prod_std'] = df_prod
-                st.session_state['df_masas_std'] = df_masas
-                st.session_state['df_energia_std'] = df_energia
-                st.balloons()
-
-            except Exception as e:
-                status.update(label="Error en el procesamiento", state="error")
-                st.error(f"❌ Ocurrió un error al cruzar los datos: {e}")
+        except Exception as e:
+            status.update(label="Error en el procesamiento", state="error")
+            st.error(f"❌ Ocurrió un error al cruzar los datos: {e}")
 
 # ==========================================
 # DASHBOARD INTERACTIVO
