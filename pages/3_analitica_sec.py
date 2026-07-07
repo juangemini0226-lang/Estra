@@ -44,6 +44,7 @@ TOLERANCIA_MINUTOS = 15          # margen de tolerancia temporal para emparejar 
 EPOCH_EXCEL_DURACION = dt.date(1899, 12, 31)  # base para reconstruir duraciones > 24h mal formateadas por Excel
 UMBRAL_VENTANA_MIN_HORAS = 2.0   # tolerancia mínima (horas) entre calendario y (activo+inactivo)
 UMBRAL_VENTANA_PCT = 0.20        # tolerancia relativa (20% de la duración calendario)
+UMBRAL_PCT_CERO_SOSPECHOSO = 40.0  # % de lecturas en 0 dentro de la ventana a partir del cual el SEC se marca como sospechoso
 
 # Posibles nombres de columnas dentro de energia.db, para tolerar variantes de esquema.
 ALIAS_COLUMNAS_ENERGIA = {
@@ -283,6 +284,7 @@ def calcular_metricas_ot(energia_ot, inicio_real, fin_real):
             'Duracion_Min_OT': round(duracion_minutos_efectiva, 1),
             'Minutos_Cubiertos': 0, 'Cobertura_Pct': 0.0, 'Continuidad_Pct': 0.0,
             'Max_Gap_Min': np.nan, 'N_Lecturas_Energia': 0,
+            'Pct_Lecturas_Cero': np.nan,
             'Score_Confiabilidad': 0.0, 'Confiabilidad': 'Sin datos'
         }
 
@@ -302,6 +304,12 @@ def calcular_metricas_ot(energia_ot, inicio_real, fin_real):
         exceso = max_gap - 5
         continuidad_pct = max(0.0, 100.0 * (1 - exceso / duracion_minutos_efectiva))
 
+    # % de minutos donde el medidor reportó exactamente 0 kWh — muchos ceros dentro de
+    # una ventana con buena cobertura suele indicar falla de lectura/umbral de standby
+    # del medidor, no que la máquina realmente no consumió energía. Esto hace que el
+    # SEC salga artificialmente bajo (mismo denominador de masa, menos energía sumada).
+    pct_lecturas_cero = round(float((energia_ot['Energia_kWh'] <= 1e-9).mean() * 100), 1)
+
     score = (cobertura_pct / 100.0 * 0.5) + (continuidad_pct / 100.0 * 0.5)
     label = 'Alta' if score >= 0.85 else ('Media' if score >= 0.60 else 'Baja')
 
@@ -315,6 +323,7 @@ def calcular_metricas_ot(energia_ot, inicio_real, fin_real):
         'Continuidad_Pct': round(continuidad_pct, 1),
         'Max_Gap_Min': round(float(max_gap), 1) if pd.notna(max_gap) else np.nan,
         'N_Lecturas_Energia': int(n_lecturas),
+        'Pct_Lecturas_Cero': pct_lecturas_cero,
         'Score_Confiabilidad': round(score, 3),
         'Confiabilidad': label
     }
@@ -403,6 +412,13 @@ def agregar_columnas_diagnostico(df):
     tol_paros = np.maximum(5, 0.10 * df['Inactivo_Min'].fillna(0))
     df['Paros_Cuadran'] = df['Suma_Paros_Min'].notna() & (df['Diferencia_Paros_vs_Inactivo'].abs() <= tol_paros)
 
+    # --- SEC sospechoso: se calculó, pero muchos minutos de la ventana tienen el medidor en 0 ---
+    df['SEC_Sospechoso'] = (
+        df['SEC_Total_kWh_kg'].notna() &
+        df['Pct_Lecturas_Cero'].notna() &
+        (df['Pct_Lecturas_Cero'] > UMBRAL_PCT_CERO_SOSPECHOSO)
+    )
+
     # --- Motivo consolidado (texto legible por OT) ---
     def _motivo(row):
         motivos = []
@@ -415,6 +431,11 @@ def agregar_columnas_diagnostico(df):
             )
         elif row.get('N_Lecturas_Energia', 0) == 0:
             motivos.append("No se encontró ninguna lectura de energía para esa máquina en esa ventana de tiempo")
+        elif row.get('SEC_Sospechoso', False):
+            motivos.append(
+                f"SEC calculado, pero {row['Pct_Lecturas_Cero']:.0f}% de los minutos en la ventana tienen el "
+                f"medidor en 0 kWh — revisar la gráfica de energía de esta OT, el SEC podría estar subestimado"
+            )
         if pd.isna(row.get('Total_Masa_Kg', np.nan)) or row.get('Total_Masa_Kg', 0) <= 0:
             motivos.append("Sin masa (kg) asociada a esta OT")
         if not row.get('Defectos_Cuadran', True):
@@ -854,7 +875,7 @@ if 'df_sec_calculado' in st.session_state:
         f"tienen datos de energía viables y ya muestran su SEC calculado."
     )
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     with col1:
         maquinas = ['Todas'] + sorted(df_board['ID_Maquina_Normalizado'].dropna().unique().tolist())
         filtro_maq = st.selectbox("🏭 Máquina:", maquinas)
@@ -870,6 +891,8 @@ if 'df_sec_calculado' in st.session_state:
             "⚡ SEC calculado:",
             ["Todas", "✅ Solo con SEC viable", "🚫 Solo sin SEC (sin datos viables)"]
         )
+    with col6:
+        solo_sospechoso = st.checkbox(f"🕵️ Solo SEC sospechoso (>{UMBRAL_PCT_CERO_SOSPECHOSO:.0f}% ceros)", value=False)
 
     if filtro_maq != 'Todas':
         df_board = df_board[df_board['ID_Maquina_Normalizado'] == filtro_maq]
@@ -883,21 +906,24 @@ if 'df_sec_calculado' in st.session_state:
         df_board = df_board[df_board['SEC_Viable']]
     elif filtro_sec == "🚫 Solo sin SEC (sin datos viables)":
         df_board = df_board[~df_board['SEC_Viable']]
+    if solo_sospechoso:
+        df_board = df_board[df_board['SEC_Sospechoso']]
 
     # Las OTs con SEC viable van primero, para que salten a la vista de inmediato.
     df_board = df_board.sort_values('SEC_Viable', ascending=False)
 
     st.markdown("#### Indicadores Globales (Según filtro)")
-    kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+    kpi1, kpi2, kpi3, kpi4, kpi5, kpi6, kpi7 = st.columns(7)
     kpi1.metric("Órdenes Procesadas", f"{len(df_board)}")
     kpi2.metric("✅ Con SEC viable", f"{int(df_board['SEC_Viable'].sum())}")
-    kpi3.metric("Masa Total (Kg)", f"{df_board['Total_Masa_Kg'].sum():,.2f}")
-    kpi4.metric("Energía Total (kWh)", f"{df_board['Energia_Total_kWh'].sum():,.2f}")
+    kpi3.metric("🕵️ SEC sospechoso", f"{int(df_board['SEC_Sospechoso'].sum())}")
+    kpi4.metric("Masa Total (Kg)", f"{df_board['Total_Masa_Kg'].sum():,.2f}")
+    kpi5.metric("Energía Total (kWh)", f"{df_board['Energia_Total_kWh'].sum():,.2f}")
     masa_total = df_board['Total_Masa_Kg'].sum()
     sec_promedio = df_board['Energia_Total_kWh'].sum() / masa_total if masa_total > 0 else 0
-    kpi5.metric("SEC Total Promedio (kWh/kg)", f"{sec_promedio:.4f}")
+    kpi6.metric("SEC Total Promedio (kWh/kg)", f"{sec_promedio:.4f}")
     pct_alta = (df_board['Confiabilidad'] == 'Alta').mean() * 100 if len(df_board) > 0 else 0
-    kpi6.metric("% OTs Confiabilidad Alta", f"{pct_alta:.0f}%")
+    kpi7.metric("% OTs Confiabilidad Alta", f"{pct_alta:.0f}%")
 
     st.markdown("#### SEC en sus 3 variantes")
     s1, s2, s3 = st.columns(3)
@@ -925,10 +951,12 @@ if 'df_sec_calculado' in st.session_state:
 
     df_tabla = df_board.copy()
     df_tabla['SEC_Viable'] = df_tabla['SEC_Viable'].map({True: '✅ Sí', False: '🚫 No'})
+    df_tabla['SEC_Sospechoso'] = df_tabla['SEC_Sospechoso'].map({True: '🕵️ Sí', False: '—'})
 
     st.dataframe(
-        df_tabla[['SEC_Viable', 'ID_Job', 'ID_Maquina', 'Inicio_Limpio', 'Fin_Limpio', 'Total_Masa_Kg', 'Masa_Buena_Kg',
-                   'Energia_Total_kWh', 'SEC_Total_kWh_kg', 'SEC_Inyeccion_kWh_kg', 'SEC_Conforme_kWh_kg',
+        df_tabla[['SEC_Viable', 'SEC_Sospechoso', 'ID_Job', 'ID_Maquina', 'Inicio_Limpio', 'Fin_Limpio',
+                   'Total_Masa_Kg', 'Masa_Buena_Kg', 'Energia_Total_kWh', 'Pct_Lecturas_Cero',
+                   'SEC_Total_kWh_kg', 'SEC_Inyeccion_kWh_kg', 'SEC_Conforme_kWh_kg',
                    'Producción de Rechazo', 'Costo_No_Conformidad', 'Energia_Desperdiciada_Rechazo_kWh',
                    'Cobertura_Pct', 'Continuidad_Pct', 'Confiabilidad', 'Ventana_Confiable',
                    'Solape_Ventana_Energia', 'Produccion_Cuadra']],
@@ -941,6 +969,14 @@ if 'df_sec_calculado' in st.session_state:
             f"lectura de energía en su ventana de tiempo, la ventana de tiempo no era confiable (columna "
             f"`Ventana_Confiable` = False), o no tienen masa asociada > 0. Usa el Inspector de Orden de abajo "
             f"para ver la razón exacta de cada caso."
+        )
+    if int(df_board['SEC_Sospechoso'].sum()) > 0:
+        st.caption(
+            f"🕵️ Las OTs marcadas como **SEC sospechoso** sí tienen SEC calculado, pero más del "
+            f"{UMBRAL_PCT_CERO_SOSPECHOSO:.0f}% de los minutos en su ventana tienen el medidor reportando "
+            f"exactamente 0 kWh (columna `Pct_Lecturas_Cero`). Eso puede ser real (la máquina realmente estuvo "
+            f"parada) o una falla del medidor — revisa la gráfica de energía de esa OT en el Inspector de Orden "
+            f"para diferenciar un caso del otro antes de confiar en ese SEC."
         )
 
     # ==========================================
@@ -961,6 +997,7 @@ if 'df_sec_calculado' in st.session_state:
             [
                 "🔥 Las que más problemas tienen (peor caso primero)",
                 "🚫 Solo sin SEC viable",
+                "🕵️ Solo SEC sospechoso (muchos ceros en energía)",
                 "⚠️ Solo con defectos que no cuadran",
                 "⚠️ Solo con paros que no cuadran",
                 "⚠️ Solo con ventana no confiable",
@@ -976,6 +1013,8 @@ if 'df_sec_calculado' in st.session_state:
         df_muestra = df_diag.sort_values('N_Problemas_Detectados', ascending=False).head(int(tamano_muestra))
     elif estrategia_muestra == "🚫 Solo sin SEC viable":
         df_muestra = df_diag[~df_diag['SEC_Viable']].head(int(tamano_muestra))
+    elif estrategia_muestra == "🕵️ Solo SEC sospechoso (muchos ceros en energía)":
+        df_muestra = df_diag[df_diag['SEC_Sospechoso']].sort_values('Pct_Lecturas_Cero', ascending=False).head(int(tamano_muestra))
     elif estrategia_muestra == "⚠️ Solo con defectos que no cuadran":
         df_muestra = df_diag[~df_diag['Defectos_Cuadran']].head(int(tamano_muestra))
     elif estrategia_muestra == "⚠️ Solo con paros que no cuadran":
@@ -1026,6 +1065,25 @@ if 'df_sec_calculado' in st.session_state:
                 else:
                     for motivo in ot_diag['Diagnostico'].split(" | "):
                         st.warning(f"• {motivo}")
+
+                if ot_diag['Ventana_Confiable']:
+                    energia_ot_diag, inicio_span_diag, fin_span_diag = buscar_energia_ot(
+                        conn_energia, tabla_usada, mapa_col_energia,
+                        ot_diag['ID_Maquina_Normalizado'],
+                        pd.to_datetime(ot_diag['Inicio_Limpio']), pd.to_datetime(ot_diag['Fin_Limpio'])
+                    )
+                    if energia_ot_diag.empty:
+                        st.info("No hay lecturas de energía en esta ventana para graficar.")
+                    else:
+                        g1, g2 = st.columns(2)
+                        g1.metric("SEC Total", f"{ot_diag['SEC_Total_kWh_kg']:.4f} kWh/kg" if pd.notna(ot_diag['SEC_Total_kWh_kg']) else "N/A")
+                        g2.metric("% minutos en 0 kWh", f"{ot_diag['Pct_Lecturas_Cero']:.0f}%" if pd.notna(ot_diag['Pct_Lecturas_Cero']) else "N/A")
+                        st.line_chart(
+                            energia_ot_diag.sort_values('Timestamp').set_index('Timestamp')[['Potencia_kW', 'Energia_kWh']],
+                            use_container_width=True
+                        )
+                else:
+                    st.caption("Ventana no confiable: no se consultó energía, por lo tanto no hay gráfica.")
 
         st.download_button(
             "⬇️ Descargar esta muestra en CSV",
@@ -1107,7 +1165,25 @@ if 'df_sec_calculado' in st.session_state:
                 if energia_ot.empty:
                     st.info("No se encontró ninguna lectura de energía en esta ventana.")
                 else:
+                    if fila_ot.get('SEC_Sospechoso', False):
+                        st.warning(
+                            f"🕵️ SEC sospechoso: {fila_ot['Pct_Lecturas_Cero']:.0f}% de los minutos en esta ventana "
+                            f"tienen el medidor en 0 kWh. Mira la gráfica de abajo para ver si son ceros dispersos "
+                            f"(probable falla del medidor) o un tramo continuo (probable parada real de la máquina)."
+                        )
+
+                    st.markdown("**Comportamiento de energía durante la OT:**")
                     energia_ot_ordenada = energia_ot.sort_values('Timestamp')
+                    st.line_chart(
+                        energia_ot_ordenada.set_index('Timestamp')[['Potencia_kW', 'Energia_kWh']],
+                        use_container_width=True
+                    )
+                    g1, g2, g3 = st.columns(3)
+                    g1.metric("Lecturas totales", f"{fila_ot['N_Lecturas_Energia']:.0f}")
+                    g2.metric("% minutos en 0 kWh", f"{fila_ot['Pct_Lecturas_Cero']:.0f}%" if pd.notna(fila_ot['Pct_Lecturas_Cero']) else "N/A")
+                    g3.metric("Potencia máx.", f"{fila_ot['Potencia_Max_kW']:.2f} kW" if pd.notna(fila_ot['Potencia_Max_kW']) else "N/A")
+
+                    st.markdown("**Detalle minuto a minuto:**")
                     st.dataframe(
                         energia_ot_ordenada[['Timestamp', 'Energia_kWh', 'Potencia_kW']],
                         use_container_width=True
