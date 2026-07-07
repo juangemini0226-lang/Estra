@@ -134,64 +134,54 @@ def _descargar_bytes_drive(file_id):
     return buffer.read()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def descargar_energia_db(_cache_bust=None):
+@st.cache_resource(show_spinner=False)
+def obtener_conexion_energia_db(clave_cache):
     """
-    Busca energia.db en la carpeta de Drive configurada, lo descarga y devuelve
-    (DataFrame de la tabla de energía, metadata del archivo) o (None, None) si no existe.
-    El parámetro _cache_bust permite forzar una recarga manual (botón "Recargar").
+    Descarga energia.db UNA sola vez (materializándolo a un archivo temporal local) y
+    devuelve una conexión sqlite3 abierta, reutilizable entre reruns de Streamlit mientras
+    'clave_cache' (la fecha de modificación en Drive) no cambie. A diferencia del enfoque
+    anterior, esta función NO carga la tabla completa en un DataFrame — eso es lo que
+    agotaba la memoria del servidor con archivos de cientos de MB. Las consultas reales se
+    hacen después, por ventana de tiempo, con SQL (ver buscar_energia_ot).
+    Devuelve (conn, archivo_meta, tabla_usada, tablas_disponibles) o (None, archivo_meta/None, None, []).
     """
     archivo = buscar_archivo_en_drive(NOMBRE_ARCHIVO_ENERGIA_DB, CARPETA_ENERGIA_DRIVE_ID)
     if archivo is None:
-        return None, None, "no_encontrado", []
+        return None, None, None, []
 
     contenido = _descargar_bytes_drive(archivo['id'])
+    tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tmp.write(contenido)
+    tmp.close()
 
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
-            tmp.write(contenido)
-            tmp_path = tmp.name
+    conn = sqlite3.connect(tmp.name, check_same_thread=False)
+    tablas = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)['name'].tolist()
+    if not tablas:
+        conn.close()
+        return None, archivo, None, []
 
-        conn = sqlite3.connect(tmp_path)
-        try:
-            tablas = pd.read_sql(
-                "SELECT name FROM sqlite_master WHERE type='table'", conn
-            )['name'].tolist()
-
-            if not tablas:
-                return None, archivo, "sin_tablas", []
-
-            tabla_a_usar = TABLA_ENERGIA_PREFERIDA if TABLA_ENERGIA_PREFERIDA in tablas else tablas[0]
-            df = pd.read_sql(f"SELECT * FROM {tabla_a_usar}", conn)
-            return df, archivo, tabla_a_usar, tablas
-        finally:
-            conn.close()
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    tabla_a_usar = TABLA_ENERGIA_PREFERIDA if TABLA_ENERGIA_PREFERIDA in tablas else tablas[0]
+    return conn, archivo, tabla_a_usar, tablas
 
 
-def estandarizar_columnas_energia(df_crudo):
+def resolver_columnas_energia_db(conn, tabla):
     """
-    Renombra las columnas de energia.db a los nombres internos que usa el motor SEC
-    (Timestamp, ID_Maquina_Texto, Energia_kWh, Potencia_kW), tolerando variantes de
-    nombre según ALIAS_COLUMNAS_ENERGIA. Devuelve (df_renombrado, columnas_faltantes).
+    Inspecciona las columnas reales de la tabla (via PRAGMA, sin leer filas) y arma el mapeo
+    a los nombres internos (Timestamp, ID_Maquina_Texto, Energia_kWh, Potencia_kW),
+    tolerando variantes de nombre según ALIAS_COLUMNAS_ENERGIA.
     """
-    df = df_crudo.copy()
-    df.columns = df.columns.str.strip()
-    mapa_renombre = {}
+    info_columnas = pd.read_sql(f'PRAGMA table_info("{tabla}")', conn)
+    columnas_reales = info_columnas['name'].tolist()
+
+    mapa = {}
     faltantes = []
-
     for nombre_interno, alias in ALIAS_COLUMNAS_ENERGIA.items():
-        encontrado = next((a for a in alias if a in df.columns), None)
+        encontrado = next((a for a in alias if a in columnas_reales), None)
         if encontrado:
-            mapa_renombre[encontrado] = nombre_interno
+            mapa[nombre_interno] = encontrado
         else:
             faltantes.append(nombre_interno)
-
-    df.rename(columns=mapa_renombre, inplace=True)
-    return df, faltantes
+    return mapa, faltantes, columnas_reales
 
 
 # ==========================================
@@ -330,11 +320,48 @@ def calcular_metricas_ot(energia_ot, inicio_real, fin_real):
     }
 
 
-def buscar_energia_ot(df_energia, maquina, inicio_real, fin_real, tolerancia_min=TOLERANCIA_MINUTOS):
+def buscar_energia_ot(conn, tabla, mapa_col, maquina, inicio_real, fin_real, tolerancia_min=TOLERANCIA_MINUTOS):
+    """
+    Trae SOLO las lecturas de energía de la máquina y ventana de tiempo de esta OT,
+    consultando directamente energia.db con SQL — nunca carga la tabla completa en memoria.
+    """
     inicio_span = inicio_real - pd.Timedelta(minutes=tolerancia_min)
     fin_span = fin_real + pd.Timedelta(minutes=tolerancia_min)
-    mask = (df_energia['ID_Maquina_Texto'] == maquina) & (df_energia['Timestamp'] >= inicio_span) & (df_energia['Timestamp'] <= fin_span)
-    return df_energia[mask].copy(), inicio_span, fin_span
+
+    col_ts, col_maq = mapa_col['Timestamp'], mapa_col['ID_Maquina_Texto']
+    col_e, col_p = mapa_col['Energia_kWh'], mapa_col['Potencia_kW']
+
+    query = f'''
+        SELECT "{col_ts}" AS Timestamp, "{col_maq}" AS ID_Maquina_Texto,
+               "{col_e}" AS Energia_kWh, "{col_p}" AS Potencia_kW
+        FROM "{tabla}"
+        WHERE UPPER(TRIM("{col_maq}")) = UPPER(?)
+          AND "{col_ts}" >= ? AND "{col_ts}" <= ?
+    '''
+    params = (
+        maquina,
+        inicio_span.strftime('%Y-%m-%d %H:%M:%S'),
+        fin_span.strftime('%Y-%m-%d %H:%M:%S'),
+    )
+    df = pd.read_sql(query, conn, params=params)
+
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce', format='mixed').dt.floor('min')
+    df.dropna(subset=['Timestamp', 'Energia_kWh'], inplace=True)
+    df['Energia_kWh'] = pd.to_numeric(df['Energia_kWh'], errors='coerce')
+    df['Potencia_kW'] = pd.to_numeric(df['Potencia_kW'], errors='coerce')
+    df['ID_Maquina_Texto'] = df['ID_Maquina_Texto'].astype(str).str.strip().str.upper()
+    return df, inicio_span, fin_span
+
+
+def listar_maquinas_energia_db(conn, tabla, mapa_col):
+    """Máquinas distintas presentes en energia.db, sin traer ninguna otra columna ni fila completa."""
+    col_maq = mapa_col['ID_Maquina_Texto']
+    df = pd.read_sql(f'SELECT DISTINCT "{col_maq}" AS m FROM "{tabla}"', conn)
+    return set(df['m'].dropna().astype(str).str.strip().str.upper())
+
+
+def contar_registros_energia_db(conn, tabla):
+    return int(pd.read_sql(f'SELECT COUNT(*) AS n FROM "{tabla}"', conn)['n'].iloc[0])
 
 
 # ==========================================
@@ -503,7 +530,7 @@ st.success(f"Datos base descargados: {len(df_prod_raw)} OTs de Producción, {len
            f"y {len(df_costo_raw)} referencias de Costo Estándar.")
 
 # ==========================================
-# 2. CONSUMO ENERGÉTICO — AHORA DESDE energia.db EN DRIVE (sin CSV manual)
+# 2. CONSUMO ENERGÉTICO — AHORA DESDE energia.db EN DRIVE (consulta SQL, sin cargar todo a memoria)
 # ==========================================
 st.markdown("### 2. Consumo Energético (energia.db en Drive)")
 
@@ -511,29 +538,31 @@ col_refresh, col_info = st.columns([1, 4])
 with col_refresh:
     forzar_recarga = st.button("🔄 Recargar energia.db")
 
-if forzar_recarga:
-    descargar_energia_db.clear()
-
 with st.spinner(f"Buscando '{NOMBRE_ARCHIVO_ENERGIA_DB}' en la carpeta de Drive..."):
-    # el segundo argumento solo se usa para invalidar el cache cuando se pulsa "Recargar"
-    df_energia_bruto, meta_archivo, tabla_usada, tablas_disponibles = descargar_energia_db(
-        _cache_bust=dt.datetime.now().isoformat() if forzar_recarga else None
-    )
+    archivo_preview = buscar_archivo_en_drive(NOMBRE_ARCHIVO_ENERGIA_DB, CARPETA_ENERGIA_DRIVE_ID)
 
-if df_energia_bruto is None:
-    if tabla_usada == "no_encontrado":
-        st.error(f"❌ No se encontró un archivo llamado **{NOMBRE_ARCHIVO_ENERGIA_DB}** en la carpeta de Drive "
-                 f"configurada (ID `{CARPETA_ENERGIA_DRIVE_ID}`). Verifica que exista y que la cuenta de servicio "
-                 f"tenga acceso de Lector/Editor a esa carpeta.")
-    else:
-        st.error(f"❌ Se encontró y descargó **{NOMBRE_ARCHIVO_ENERGIA_DB}**, pero no tiene tablas legibles.")
+if archivo_preview is None:
+    st.error(f"❌ No se encontró un archivo llamado **{NOMBRE_ARCHIVO_ENERGIA_DB}** en la carpeta de Drive "
+             f"configurada (ID `{CARPETA_ENERGIA_DRIVE_ID}`). Verifica que exista y que la cuenta de servicio "
+             f"tenga acceso de Lector/Editor a esa carpeta.")
     st.stop()
 
-df_energia, columnas_faltantes = estandarizar_columnas_energia(df_energia_bruto)
+clave_cache_energia = archivo_preview.get('modifiedTime', 'sin_fecha')
+if forzar_recarga:
+    obtener_conexion_energia_db.clear()
+
+with st.spinner("Abriendo energia.db (solo se descarga completo si cambió en Drive; las consultas después son por ventana de tiempo)..."):
+    conn_energia, meta_archivo, tabla_usada, tablas_disponibles = obtener_conexion_energia_db(clave_cache_energia)
+
+if conn_energia is None:
+    st.error(f"❌ Se encontró y descargó **{NOMBRE_ARCHIVO_ENERGIA_DB}**, pero no tiene tablas legibles.")
+    st.stop()
+
+mapa_col_energia, columnas_faltantes, columnas_reales_energia = resolver_columnas_energia_db(conn_energia, tabla_usada)
 
 if columnas_faltantes:
     st.error(f"❌ La tabla `{tabla_usada}` de energia.db no tiene (ni con alias conocidos) estas columnas: "
-             f"{columnas_faltantes}. Columnas reales encontradas: {list(df_energia_bruto.columns)}. "
+             f"{columnas_faltantes}. Columnas reales encontradas: {columnas_reales_energia}. "
              f"Ajusta `ALIAS_COLUMNAS_ENERGIA` o `TABLA_ENERGIA_PREFERIDA` en el código con el nombre correcto.")
     if len(tablas_disponibles) > 1:
         st.info(f"Otras tablas disponibles en el archivo: {tablas_disponibles}")
@@ -541,8 +570,15 @@ if columnas_faltantes:
 
 with col_info:
     fecha_mod = meta_archivo.get('modifiedTime', 'desconocida') if meta_archivo else 'desconocida'
-    st.success(f"✅ **{NOMBRE_ARCHIVO_ENERGIA_DB}** cargado desde Drive (tabla `{tabla_usada}`, {len(df_energia):,} registros). "
-               f"Última modificación en Drive: {fecha_mod}.")
+    n_registros_energia = contar_registros_energia_db(conn_energia, tabla_usada)
+    st.success(f"✅ **{NOMBRE_ARCHIVO_ENERGIA_DB}** conectado (tabla `{tabla_usada}`, {n_registros_energia:,} registros totales). "
+               f"Última modificación en Drive: {fecha_mod}. Las consultas se hacen por ventana de tiempo de cada OT, "
+               f"nunca se carga la tabla completa a memoria.")
+
+# Se guarda para que el Inspector de Orden pueda reabrir la misma conexión (cacheada) más adelante.
+st.session_state['clave_cache_energia'] = clave_cache_energia
+st.session_state['tabla_energia_usada'] = tabla_usada
+st.session_state['mapa_col_energia'] = mapa_col_energia
 
 if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
     with st.status("Procesando Motor SEC...", expanded=True) as status:
@@ -699,27 +735,18 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
                 st.warning(f"⚠️ {n_solapes} OTs tienen su ventana de ±{TOLERANCIA_MINUTOS} min traslapada con la OT "
                            f"anterior de la misma máquina — posible doble conteo de energía.")
 
-            # --- PREPARAR ENERGÍA (ya viene de energia.db, descargado arriba) ---
-            st.write(f"⚡ Preparando datos de Energía desde energia.db (tabla `{tabla_usada}`)...")
-            df_energia_prep = df_energia.copy()
-
-            df_energia_prep['Timestamp'] = pd.to_datetime(
-                df_energia_prep['Timestamp'].astype(str), format='mixed', errors='coerce'
-            ).dt.floor('min')
-            df_energia_prep.dropna(subset=['Timestamp', 'Energia_kWh'], inplace=True)
-            df_energia_prep['Energia_kWh'] = pd.to_numeric(df_energia_prep['Energia_kWh'], errors='coerce')
-            df_energia_prep['Potencia_kW'] = pd.to_numeric(df_energia_prep['Potencia_kW'], errors='coerce')
-            df_energia_prep['ID_Maquina_Texto'] = df_energia_prep['ID_Maquina_Texto'].astype(str).str.strip().str.upper()
-
+            # --- ENERGÍA: no se carga la tabla completa, solo se listan las máquinas presentes ---
+            st.write(f"⚡ Consultando máquinas disponibles en energia.db (tabla `{tabla_usada}`)...")
             maquinas_prod = set(df_consolidado['ID_Maquina_Normalizado'].dropna().unique())
-            maquinas_nrg = set(df_energia_prep['ID_Maquina_Texto'].dropna().unique())
+            maquinas_nrg = listar_maquinas_energia_db(conn_energia, tabla_usada, mapa_col_energia)
             maquinas_sin_energia = sorted(maquinas_prod - maquinas_nrg)
             if maquinas_sin_energia:
                 st.warning(f"⚠️ Estas máquinas de Producción no aparecen (con ese nombre exacto) en energia.db: "
                            f"{maquinas_sin_energia}. Todas sus OTs quedarán con 'Sin datos'.")
 
             # --- CRUCE FINAL (MOTOR SEC) ---
-            st.write(f"🧠 Ejecutando emparejamiento con tolerancia temporal (±{TOLERANCIA_MINUTOS} min)...")
+            st.write(f"🧠 Ejecutando emparejamiento con tolerancia temporal (±{TOLERANCIA_MINUTOS} min), "
+                     f"consultando energia.db OT por OT (sin cargarlo completo)...")
             resultados_sec = []
 
             for _, ot in df_consolidado.iterrows():
@@ -733,11 +760,13 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
                 ventana_confiable = bool(ot['Ventana_Confiable'])
 
                 if ventana_confiable:
-                    energia_ot, _, _ = buscar_energia_ot(df_energia_prep, maquina_ot, inicio_real, fin_real)
+                    energia_ot, _, _ = buscar_energia_ot(
+                        conn_energia, tabla_usada, mapa_col_energia, maquina_ot, inicio_real, fin_real
+                    )
                 else:
                     # No confiamos en el rango calendario: no buscamos energía para no
                     # atribuirle a esta OT el consumo de otras órdenes intermedias.
-                    energia_ot = df_energia_prep.iloc[0:0]
+                    energia_ot = pd.DataFrame(columns=['Timestamp', 'ID_Maquina_Texto', 'Energia_kWh', 'Potencia_kW'])
 
                 metricas = calcular_metricas_ot(energia_ot, inicio_real, fin_real)
                 if not ventana_confiable:
@@ -799,7 +828,6 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
             st.session_state['df_sec_calculado'] = df_resultado_final
             st.session_state['df_prod_std'] = df_prod
             st.session_state['df_masas_std'] = df_masas
-            st.session_state['df_energia_std'] = df_energia_prep
             st.balloons()
 
         except Exception as e:
@@ -1057,14 +1085,21 @@ if 'df_sec_calculado' in st.session_state:
                     st.caption(f"Suma de filas incluidas: **{total_incluido:.2f} Kg**.")
 
         with tab_energia:
-            df_energia_std = st.session_state.get('df_energia_std')
+            clave_cache_insp = st.session_state.get('clave_cache_energia')
+            tabla_insp = st.session_state.get('tabla_energia_usada')
+            mapa_col_insp = st.session_state.get('mapa_col_energia')
+
             if not fila_ot['Ventana_Confiable']:
                 st.info("No se consultó energía para esta OT (ventana no confiable).")
-            elif df_energia_std is not None:
+            elif clave_cache_insp and tabla_insp and mapa_col_insp:
+                # Misma conexión cacheada de la sección 2 (no vuelve a descargar el archivo).
+                conn_insp, _, _, _ = obtener_conexion_energia_db(clave_cache_insp)
                 maquina_norm = fila_ot['ID_Maquina_Normalizado']
                 inicio_real = pd.to_datetime(fila_ot['Inicio_Limpio'])
                 fin_real = pd.to_datetime(fila_ot['Fin_Limpio'])
-                energia_ot, inicio_span, fin_span = buscar_energia_ot(df_energia_std, maquina_norm, inicio_real, fin_real)
+                energia_ot, inicio_span, fin_span = buscar_energia_ot(
+                    conn_insp, tabla_insp, mapa_col_insp, maquina_norm, inicio_real, fin_real
+                )
 
                 st.caption(f"Ventana real: **{inicio_real} → {fin_real}**. Con tolerancia (±{TOLERANCIA_MINUTOS} min): "
                            f"**{inicio_span} → {fin_span}**.")
@@ -1083,6 +1118,8 @@ if 'df_sec_calculado' in st.session_state:
                           if pd.notna(fila_ot['Energia_Activa_Estimada_kWh']) else "N/A")
                 c2.metric("Energía en parada estimada", f"{fila_ot['Energia_Parada_Estimada_kWh']:.2f} kWh "
                           f"({fila_ot['Energia_Parada_Pct']:.1f}%)" if pd.notna(fila_ot['Energia_Parada_Pct']) else "N/A")
+            else:
+                st.info("Vuelve a correr el cruce en esta sesión para poder consultar el detalle de energía aquí.")
 
         with tab_calidad:
             st.markdown(f"**Producción Total:** {fila_ot['Producción Total']:.0f} | "
