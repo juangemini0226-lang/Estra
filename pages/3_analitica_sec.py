@@ -230,15 +230,20 @@ def clasificar_unidad_masa(descripcion, total):
 # ==========================================
 def parsear_duracion_minutos(valor):
     """
-    Convierte el valor crudo de 'Tiempo de Actividad'/'Tiempo de Inactividad'
-    a minutos, sin importar cómo Excel/Sheets lo haya tipado:
-    - datetime.timedelta -> ya es una duración real, se usa tal cual.
-    - datetime.datetime  -> Excel guardó una duración >24h como fecha+hora;
-      se reconstruye usando el offset de días desde 1899-12-31 (el mismo
-      epoch que usa Excel para sus números seriales de fecha/hora).
-    - datetime.time      -> duración dentro de un mismo día (<24h).
-    - cualquier otro caso (NaN, texto raro) -> np.nan (dato no disponible).
+    Convierte el valor crudo de 'Tiempo de Actividad'/'Tiempo de Inactividad' a minutos.
+    Soporta los distintos tipos que puede entregar cada fuente de datos:
+    - Vía gspread (Google Sheets API): normalmente llega como TEXTO ya formateado,
+      ej. '21:53:00' o '7:21:00'. El formato de duración de Sheets ('[h]:mm:ss') expresa
+      el total de horas sin reiniciar cada 24h, así que un texto como '168:00:00' (una
+      semana) se interpreta correctamente sin necesidad de reconstruir nada.
+    - Vía lectura directa de un .xlsx con openpyxl/pandas: llega como
+      datetime.timedelta, datetime.datetime (cuando Excel guardó una duración >24h como
+      fecha+hora, usando el epoch 1899-12-31) o datetime.time (duración <24h).
+    - Número (int/float): fracción de día en formato serial de Excel/Sheets.
+    - Vacío, 'Current', texto no reconocible o None -> np.nan (dato no disponible).
     """
+    if valor is None:
+        return np.nan
     if isinstance(valor, dt.timedelta):
         return valor.total_seconds() / 60.0
     if isinstance(valor, dt.datetime):
@@ -246,7 +251,32 @@ def parsear_duracion_minutos(valor):
         return dias * 24 * 60 + valor.hour * 60 + valor.minute + valor.second / 60.0
     if isinstance(valor, dt.time):
         return valor.hour * 60 + valor.minute + valor.second / 60.0
-    return np.nan
+    if isinstance(valor, (int, float)):
+        if pd.isna(valor):
+            return np.nan
+        return float(valor) * 24 * 60
+
+    texto = str(valor).strip()
+    if texto == '' or texto.lower() in ('nan', 'none'):
+        return np.nan
+
+    # 'HH:MM:SS' o 'H:MM:SS' — soporta horas >24 (ej. '168:00:00' = 1 semana)
+    m = re.match(r'^(\d{1,5}):(\d{2}):(\d{2})$', texto)
+    if m:
+        h, mi, s = m.groups()
+        return int(h) * 60 + int(mi) + int(s) / 60.0
+
+    # 'H:MM' sin segundos
+    m = re.match(r'^(\d{1,5}):(\d{2})$', texto)
+    if m:
+        h, mi = m.groups()
+        return int(h) * 60 + int(mi)
+
+    # Número como texto (serial de fecha, fracción de día), por si Sheets lo entrega así
+    try:
+        return float(texto.replace(',', '.')) * 24 * 60
+    except ValueError:
+        return np.nan
 
 
 # ==========================================
@@ -545,6 +575,30 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
             df_prod['Inactivo_Min'] = df_prod['Tiempo de Inactividad'].apply(parsear_duracion_minutos)
             df_prod['Duracion_Calendario_Min'] = (df_prod['Fin_Limpio'] - df_prod['Inicio_Limpio']).dt.total_seconds() / 60.0
             df_prod['Duracion_Real_Min'] = df_prod['Activo_Min'] + df_prod['Inactivo_Min']
+
+            # --- Diagnóstico del parseo: cuántas filas SÍ se pudieron leer y muestra de las que no ---
+            n_activo_nan = int(df_prod['Activo_Min'].isna().sum())
+            n_inactivo_nan = int(df_prod['Inactivo_Min'].isna().sum())
+            with st.expander(
+                f"🔬 Diagnóstico de lectura de 'Tiempo de Actividad'/'Tiempo de Inactividad' "
+                f"({len(df_prod) - n_activo_nan}/{len(df_prod)} de Actividad y "
+                f"{len(df_prod) - n_inactivo_nan}/{len(df_prod)} de Inactividad se leyeron con éxito)"
+            ):
+                st.write("Muestra de valores crudos vs. minutos ya interpretados (primeras 8 filas):")
+                st.dataframe(
+                    df_prod[['ID_Job', 'Tiempo de Actividad', 'Activo_Min', 'Tiempo de Inactividad', 'Inactivo_Min']].head(8),
+                    use_container_width=True
+                )
+                if n_activo_nan > 0 or n_inactivo_nan > 0:
+                    filas_no_leidas = df_prod[df_prod['Activo_Min'].isna() | df_prod['Inactivo_Min'].isna()]
+                    st.write(f"Muestra de filas que **no** se pudieron interpretar ({len(filas_no_leidas)} en total):")
+                    st.dataframe(
+                        filas_no_leidas[['ID_Job', 'Tiempo de Actividad', 'Tiempo de Inactividad']].head(10),
+                        use_container_width=True
+                    )
+                    st.caption("Si ves aquí un formato de texto distinto a 'HH:MM:SS' (ej. con la palabra 'día', "
+                               "o un formato con coma decimal), avísame con un par de ejemplos exactos de esta "
+                               "tabla para ajustar el parser a ese formato puntual.")
 
             tiene_tiempos = df_prod['Duracion_Real_Min'].notna()
             diferencia_min = (df_prod['Duracion_Calendario_Min'] - df_prod['Duracion_Real_Min']).abs()
