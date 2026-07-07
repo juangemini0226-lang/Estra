@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import datetime as dt
 import gspread
+import plotly.graph_objects as go
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -371,6 +372,87 @@ def listar_maquinas_energia_db(conn, tabla, mapa_col):
 
 def contar_registros_energia_db(conn, tabla):
     return int(pd.read_sql(f'SELECT COUNT(*) AS n FROM "{tabla}"', conn)['n'].iloc[0])
+
+
+# ==========================================
+# FUNCIONES DE GRÁFICO — ENERGÍA CON MARCADORES DE VENTANA
+# ==========================================
+def buscar_ots_vecinas(df_prod_std, maquina_norm, id_job_actual, inicio_span, fin_span):
+    """
+    Busca otras OTs de la misma máquina cuya ventana calendario se traslape con el rango
+    consultado (inicio_span/fin_span, ya con tolerancia). Sirve para marcar en la gráfica si
+    la energía mostrada podría estar "contaminada" por otra orden que corrió al mismo tiempo.
+    """
+    if df_prod_std is None or df_prod_std.empty:
+        return df_prod_std.iloc[0:0] if df_prod_std is not None else pd.DataFrame()
+
+    df_m = df_prod_std[
+        (df_prod_std['ID_Maquina_Normalizado'] == maquina_norm) &
+        (df_prod_std['ID_Job'].astype(str) != str(id_job_actual))
+    ]
+    solapan = df_m[
+        (df_m['Inicio_Limpio'] <= fin_span) & (df_m['Fin_Limpio'] >= inicio_span)
+    ]
+    return solapan
+
+
+def _agregar_linea_vertical(fig, x, texto, color, dash='dot'):
+    fig.add_shape(
+        type='line', xref='x', yref='paper',
+        x0=x, x1=x, y0=0, y1=1,
+        line=dict(color=color, width=2, dash=dash)
+    )
+    fig.add_annotation(
+        x=x, y=1, xref='x', yref='paper', yshift=10,
+        text=texto, showarrow=False, font=dict(color=color, size=11),
+        textangle=-90, xanchor='left', yanchor='bottom'
+    )
+
+
+def construir_grafico_energia_ot(df_energia_ot, inicio_real, fin_real, inicio_span, fin_span,
+                                  id_job_actual, df_prod_std, maquina_norm):
+    """
+    Gráfica de Potencia/Energía en el tiempo con líneas verticales marcando:
+    - Inicio y Fin real de la OT (verde/rojo).
+    - Inicio/Fin de cualquier OT vecina de la misma máquina que se traslape con la ventana
+      consultada (naranja punteado), para detectar visualmente si la energía podría
+      pertenecer parcialmente a otra orden.
+    No marca paros individuales: la fuente de datos solo trae el tiempo total y la cuenta
+    por causa de paro para TODA la OT, no el instante exacto de cada uno.
+    """
+    fig = go.Figure()
+
+    if not df_energia_ot.empty:
+        df_plot = df_energia_ot.sort_values('Timestamp')
+        fig.add_trace(go.Scatter(
+            x=df_plot['Timestamp'], y=df_plot['Potencia_kW'],
+            name='Potencia (kW)', mode='lines+markers', line=dict(color='#1f77b4'), marker=dict(size=4)
+        ))
+        fig.add_trace(go.Scatter(
+            x=df_plot['Timestamp'], y=df_plot['Energia_kWh'],
+            name='Energía (kWh)', mode='lines+markers', line=dict(color='#ff7f0e'), marker=dict(size=4),
+            yaxis='y2'
+        ))
+
+    _agregar_linea_vertical(fig, inicio_real, f"Inicio OT {id_job_actual}", '#2ca02c', dash='solid')
+    _agregar_linea_vertical(fig, fin_real, f"Fin OT {id_job_actual}", '#d62728', dash='solid')
+
+    vecinas = buscar_ots_vecinas(df_prod_std, maquina_norm, id_job_actual, inicio_span, fin_span)
+    for _, vecina in vecinas.iterrows():
+        if inicio_span <= vecina['Inicio_Limpio'] <= fin_span:
+            _agregar_linea_vertical(fig, vecina['Inicio_Limpio'], f"Inicia OT {vecina['ID_Job']}", '#ff7f0e')
+        if inicio_span <= vecina['Fin_Limpio'] <= fin_span:
+            _agregar_linea_vertical(fig, vecina['Fin_Limpio'], f"Termina OT {vecina['ID_Job']}", '#ff7f0e')
+
+    fig.update_layout(
+        height=380,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
+        xaxis=dict(title=None),
+        yaxis=dict(title='Potencia (kW)'),
+        yaxis2=dict(title='Energía (kWh)', overlaying='y', side='right'),
+    )
+    return fig, len(vecinas)
 
 
 # ==========================================
@@ -1067,21 +1149,25 @@ if 'df_sec_calculado' in st.session_state:
                         st.warning(f"• {motivo}")
 
                 if ot_diag['Ventana_Confiable']:
+                    inicio_real_diag = pd.to_datetime(ot_diag['Inicio_Limpio'])
+                    fin_real_diag = pd.to_datetime(ot_diag['Fin_Limpio'])
                     energia_ot_diag, inicio_span_diag, fin_span_diag = buscar_energia_ot(
                         conn_energia, tabla_usada, mapa_col_energia,
-                        ot_diag['ID_Maquina_Normalizado'],
-                        pd.to_datetime(ot_diag['Inicio_Limpio']), pd.to_datetime(ot_diag['Fin_Limpio'])
+                        ot_diag['ID_Maquina_Normalizado'], inicio_real_diag, fin_real_diag
                     )
+                    g1, g2 = st.columns(2)
+                    g1.metric("SEC Total", f"{ot_diag['SEC_Total_kWh_kg']:.4f} kWh/kg" if pd.notna(ot_diag['SEC_Total_kWh_kg']) else "N/A")
+                    g2.metric("% minutos en 0 kWh", f"{ot_diag['Pct_Lecturas_Cero']:.0f}%" if pd.notna(ot_diag['Pct_Lecturas_Cero']) else "N/A")
+
+                    fig_diag, n_vecinas_diag = construir_grafico_energia_ot(
+                        energia_ot_diag, inicio_real_diag, fin_real_diag, inicio_span_diag, fin_span_diag,
+                        ot_diag['ID_Job'], st.session_state.get('df_prod_std'), ot_diag['ID_Maquina_Normalizado']
+                    )
+                    st.plotly_chart(fig_diag, use_container_width=True)
+                    if n_vecinas_diag > 0:
+                        st.caption(f"⚠️ {n_vecinas_diag} OT(s) vecina(s) traslapada(s) (línea naranja).")
                     if energia_ot_diag.empty:
-                        st.info("No hay lecturas de energía en esta ventana para graficar.")
-                    else:
-                        g1, g2 = st.columns(2)
-                        g1.metric("SEC Total", f"{ot_diag['SEC_Total_kWh_kg']:.4f} kWh/kg" if pd.notna(ot_diag['SEC_Total_kWh_kg']) else "N/A")
-                        g2.metric("% minutos en 0 kWh", f"{ot_diag['Pct_Lecturas_Cero']:.0f}%" if pd.notna(ot_diag['Pct_Lecturas_Cero']) else "N/A")
-                        st.line_chart(
-                            energia_ot_diag.sort_values('Timestamp').set_index('Timestamp')[['Potencia_kW', 'Energia_kWh']],
-                            use_container_width=True
-                        )
+                        st.caption("No hay lecturas de energía en esta ventana.")
                 else:
                     st.caption("Ventana no confiable: no se consultó energía, por lo tanto no hay gráfica.")
 
@@ -1162,28 +1248,39 @@ if 'df_sec_calculado' in st.session_state:
                 st.caption(f"Ventana real: **{inicio_real} → {fin_real}**. Con tolerancia (±{TOLERANCIA_MINUTOS} min): "
                            f"**{inicio_span} → {fin_span}**.")
 
+                if fila_ot.get('SEC_Sospechoso', False):
+                    st.warning(
+                        f"🕵️ SEC sospechoso: {fila_ot['Pct_Lecturas_Cero']:.0f}% de los minutos en esta ventana "
+                        f"tienen el medidor en 0 kWh. Mira la gráfica de abajo para ver si son ceros dispersos "
+                        f"(probable falla del medidor) o un tramo continuo (probable parada real de la máquina)."
+                    )
+
+                st.markdown("**Comportamiento de energía durante la OT** (líneas verdes/rojas = inicio/fin de "
+                            "esta OT; líneas naranjas = inicio/fin de otra OT de la misma máquina que se traslapa "
+                            "con esta ventana):")
+                df_prod_para_grafico = st.session_state.get('df_prod_std')
+                fig_energia, n_vecinas = construir_grafico_energia_ot(
+                    energia_ot, inicio_real, fin_real, inicio_span, fin_span,
+                    id_job_elegido, df_prod_para_grafico, maquina_norm
+                )
+                st.plotly_chart(fig_energia, use_container_width=True)
+                if n_vecinas > 0:
+                    st.caption(f"⚠️ Se encontraron {n_vecinas} OT(s) de la misma máquina traslapadas con esta "
+                               f"ventana — marcadas en naranja en la gráfica.")
+                st.caption("ℹ️ No se marcan paros individuales: la fuente de datos solo trae el tiempo total y la "
+                           "cuenta por causa de paro para toda la OT, no el instante exacto de cada uno. Si en algún "
+                           "momento tienes un registro de paros con hora de inicio/fin, se pueden graficar igual.")
+
                 if energia_ot.empty:
                     st.info("No se encontró ninguna lectura de energía en esta ventana.")
                 else:
-                    if fila_ot.get('SEC_Sospechoso', False):
-                        st.warning(
-                            f"🕵️ SEC sospechoso: {fila_ot['Pct_Lecturas_Cero']:.0f}% de los minutos en esta ventana "
-                            f"tienen el medidor en 0 kWh. Mira la gráfica de abajo para ver si son ceros dispersos "
-                            f"(probable falla del medidor) o un tramo continuo (probable parada real de la máquina)."
-                        )
-
-                    st.markdown("**Comportamiento de energía durante la OT:**")
-                    energia_ot_ordenada = energia_ot.sort_values('Timestamp')
-                    st.line_chart(
-                        energia_ot_ordenada.set_index('Timestamp')[['Potencia_kW', 'Energia_kWh']],
-                        use_container_width=True
-                    )
                     g1, g2, g3 = st.columns(3)
                     g1.metric("Lecturas totales", f"{fila_ot['N_Lecturas_Energia']:.0f}")
                     g2.metric("% minutos en 0 kWh", f"{fila_ot['Pct_Lecturas_Cero']:.0f}%" if pd.notna(fila_ot['Pct_Lecturas_Cero']) else "N/A")
                     g3.metric("Potencia máx.", f"{fila_ot['Potencia_Max_kW']:.2f} kW" if pd.notna(fila_ot['Potencia_Max_kW']) else "N/A")
 
                     st.markdown("**Detalle minuto a minuto:**")
+                    energia_ot_ordenada = energia_ot.sort_values('Timestamp')
                     st.dataframe(
                         energia_ot_ordenada[['Timestamp', 'Energia_kWh', 'Potencia_kW']],
                         use_container_width=True
