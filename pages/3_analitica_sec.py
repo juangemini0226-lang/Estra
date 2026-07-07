@@ -308,6 +308,86 @@ def buscar_energia_ot(df_energia, maquina, inicio_real, fin_real, tolerancia_min
 
 
 # ==========================================
+# FUNCIONES DE CÁLCULO — DIAGNÓSTICO DE CONVERGENCIA
+# ==========================================
+def agregar_columnas_diagnostico(df):
+    """
+    Agrega, de forma vectorizada, las columnas que permiten diagnosticar por qué una OT
+    no converge: si los defectos por tipo cuadran con la Producción de Rechazo reportada,
+    si los paros por causa cuadran con el Tiempo de Inactividad reportado, y arma un texto
+    con el motivo consolidado (o varios motivos) por el que la OT no tiene SEC viable o
+    tiene datos inconsistentes.
+    """
+    df = df.copy()
+
+    # --- Defectos por tipo vs Producción de Rechazo ---
+    cols_defecto = [c for c in df.columns if c.startswith('Defecto_')]
+    if cols_defecto:
+        df['Suma_Defectos'] = df[cols_defecto].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+    else:
+        df['Suma_Defectos'] = np.nan
+    df['Diferencia_Defectos_vs_Rechazo'] = df['Producción de Rechazo'] - df['Suma_Defectos']
+    tol_defectos = np.maximum(1, 0.05 * df['Producción de Rechazo'])
+    df['Defectos_Cuadran'] = df['Suma_Defectos'].notna() & (df['Diferencia_Defectos_vs_Rechazo'].abs() <= tol_defectos)
+
+    # --- Paros por causa vs Tiempo de Inactividad ---
+    cols_paro_tiempo = [c for c in df.columns if c.startswith('Paro_') and c.endswith('_Tiempo')]
+    cols_paro_min = []
+    for c in cols_paro_tiempo:
+        col_min = f'_{c}_Min_tmp'
+        df[col_min] = df[c].apply(parsear_duracion_minutos)
+        cols_paro_min.append(col_min)
+    if cols_paro_min:
+        df['Suma_Paros_Min'] = df[cols_paro_min].sum(axis=1, skipna=True)
+        df.drop(columns=cols_paro_min, inplace=True)
+    else:
+        df['Suma_Paros_Min'] = np.nan
+    df['Diferencia_Paros_vs_Inactivo'] = df['Inactivo_Min'] - df['Suma_Paros_Min']
+    tol_paros = np.maximum(5, 0.10 * df['Inactivo_Min'].fillna(0))
+    df['Paros_Cuadran'] = df['Suma_Paros_Min'].notna() & (df['Diferencia_Paros_vs_Inactivo'].abs() <= tol_paros)
+
+    # --- Motivo consolidado (texto legible por OT) ---
+    def _motivo(row):
+        motivos = []
+        if not row['Ventana_Confiable']:
+            dif = row.get('Diferencia_Ventana_Min', np.nan)
+            motivos.append(
+                f"Ventana de tiempo no confiable: el calendario (Fin−Inicio) difiere "
+                f"{dif:.0f} min del tiempo real (Actividad+Inactividad)" if pd.notna(dif)
+                else "Ventana de tiempo no confiable (faltan Tiempo de Actividad/Inactividad)"
+            )
+        elif row.get('N_Lecturas_Energia', 0) == 0:
+            motivos.append("No se encontró ninguna lectura de energía para esa máquina en esa ventana de tiempo")
+        if pd.isna(row.get('Total_Masa_Kg', np.nan)) or row.get('Total_Masa_Kg', 0) <= 0:
+            motivos.append("Sin masa (kg) asociada a esta OT")
+        if not row.get('Defectos_Cuadran', True):
+            motivos.append(
+                f"Defectos por tipo suman {row['Suma_Defectos']:.0f} vs. Producción de Rechazo "
+                f"reportada de {row['Producción de Rechazo']:.0f} (dif. {row['Diferencia_Defectos_vs_Rechazo']:.0f})"
+            )
+        if not row.get('Paros_Cuadran', True):
+            motivos.append(
+                f"Paros por causa suman {row['Suma_Paros_Min']:.0f} min vs. Tiempo de Inactividad "
+                f"reportado de {row.get('Inactivo_Min', float('nan')):.0f} min "
+                f"(dif. {row['Diferencia_Paros_vs_Inactivo']:.0f} min)"
+            )
+        if not row.get('Produccion_Cuadra', True):
+            motivos.append(
+                f"Producción Total ({row['Producción Total']:.0f}) no coincide con Buena+Rechazo "
+                f"({row['Producción Buena']:.0f}+{row['Producción de Rechazo']:.0f})"
+            )
+        if row.get('Solape_Ventana_Energia', False):
+            motivos.append("Ventana de energía traslapada con la OT anterior de la misma máquina (riesgo de doble conteo)")
+        return " | ".join(motivos) if motivos else "Sin inconsistencias detectadas"
+
+    df['Diagnostico'] = df.apply(_motivo, axis=1)
+    df['N_Problemas_Detectados'] = df['Diagnostico'].apply(
+        lambda t: 0 if t == "Sin inconsistencias detectadas" else t.count('|') + 1
+    )
+    return df
+
+
+# ==========================================
 # 1. RESOLUCIÓN DE HOJAS
 # ==========================================
 st.markdown("### 1. Extracción de Datos Maestros")
@@ -658,6 +738,9 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
 
             df_resultado_final = pd.DataFrame(resultados_sec)
 
+            st.write("🩺 Calculando diagnóstico de convergencia (defectos, paros, ventanas)...")
+            df_resultado_final = agregar_columnas_diagnostico(df_resultado_final)
+
             status.update(label="¡Cálculo SEC completado exitosamente!", state="complete", expanded=False)
             st.session_state['df_sec_calculado'] = df_resultado_final
             st.session_state['df_prod_std'] = df_prod
@@ -776,6 +859,97 @@ if 'df_sec_calculado' in st.session_state:
             f"lectura de energía en su ventana de tiempo, la ventana de tiempo no era confiable (columna "
             f"`Ventana_Confiable` = False), o no tienen masa asociada > 0. Usa el Inspector de Orden de abajo "
             f"para ver la razón exacta de cada caso."
+        )
+
+    # ==========================================
+    # 🩺 DIAGNÓSTICO DE CONVERGENCIA — muestra acotada de OTs
+    # ==========================================
+    st.divider()
+    st.markdown("## 🩺 Diagnóstico de Convergencia (muestra)")
+    st.write("Revisa una porción manejable de OTs para entender por qué no convergen: ventanas de tiempo que no "
+             "cuadran, defectos por tipo que no suman lo mismo que la Producción de Rechazo, o paros por causa "
+             "que no suman el Tiempo de Inactividad reportado.")
+
+    dcol1, dcol2, dcol3 = st.columns([1.2, 1.5, 1])
+    with dcol1:
+        tamano_muestra = st.number_input("Tamaño de la muestra:", min_value=5, max_value=200, value=15, step=5)
+    with dcol2:
+        estrategia_muestra = st.selectbox(
+            "¿Qué OTs incluir en la muestra?",
+            [
+                "🔥 Las que más problemas tienen (peor caso primero)",
+                "🚫 Solo sin SEC viable",
+                "⚠️ Solo con defectos que no cuadran",
+                "⚠️ Solo con paros que no cuadran",
+                "⚠️ Solo con ventana no confiable",
+                "🎲 Aleatoria",
+                "📋 Las primeras N (tal como vienen)",
+            ]
+        )
+    with dcol3:
+        st.metric("OTs con ≥1 problema", f"{int((df_board['N_Problemas_Detectados'] > 0).sum())} / {len(df_board)}")
+
+    df_diag = df_board.copy()
+    if estrategia_muestra == "🔥 Las que más problemas tienen (peor caso primero)":
+        df_muestra = df_diag.sort_values('N_Problemas_Detectados', ascending=False).head(int(tamano_muestra))
+    elif estrategia_muestra == "🚫 Solo sin SEC viable":
+        df_muestra = df_diag[~df_diag['SEC_Viable']].head(int(tamano_muestra))
+    elif estrategia_muestra == "⚠️ Solo con defectos que no cuadran":
+        df_muestra = df_diag[~df_diag['Defectos_Cuadran']].head(int(tamano_muestra))
+    elif estrategia_muestra == "⚠️ Solo con paros que no cuadran":
+        df_muestra = df_diag[~df_diag['Paros_Cuadran']].head(int(tamano_muestra))
+    elif estrategia_muestra == "⚠️ Solo con ventana no confiable":
+        df_muestra = df_diag[~df_diag['Ventana_Confiable']].head(int(tamano_muestra))
+    elif estrategia_muestra == "🎲 Aleatoria":
+        df_muestra = df_diag.sample(n=min(int(tamano_muestra), len(df_diag)), random_state=None) if len(df_diag) > 0 else df_diag
+    else:  # primeras N tal como vienen
+        df_muestra = df_diag.head(int(tamano_muestra))
+
+    if df_muestra.empty:
+        st.info("No hay OTs que cumplan ese criterio con el filtro actual del tablero.")
+    else:
+        st.markdown(f"#### Resumen de la muestra ({len(df_muestra)} OTs)")
+        st.dataframe(
+            df_muestra[['ID_Job', 'ID_Maquina', 'SEC_Viable', 'Ventana_Confiable', 'Diferencia_Ventana_Min',
+                        'Produccion_Cuadra', 'Defectos_Cuadran', 'Diferencia_Defectos_vs_Rechazo',
+                        'Paros_Cuadran', 'Diferencia_Paros_vs_Inactivo', 'N_Problemas_Detectados', 'Diagnostico']],
+            use_container_width=True
+        )
+
+        st.markdown("#### Detalle OT por OT (dentro de la muestra)")
+        for _, ot_diag in df_muestra.iterrows():
+            etiqueta_sec = "✅" if ot_diag['SEC_Viable'] else "🚫"
+            with st.expander(f"{etiqueta_sec} OT `{ot_diag['ID_Job']}` — Máquina `{ot_diag['ID_Maquina']}` "
+                              f"— {ot_diag['N_Problemas_Detectados']} problema(s)"):
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Tiempo Calendario", f"{ot_diag['Duracion_Calendario_Min']:.0f} min")
+                d2.metric("Tiempo Real (Activo+Inactivo)", f"{ot_diag['Duracion_Real_Min']:.0f} min"
+                          if pd.notna(ot_diag['Duracion_Real_Min']) else "N/A")
+                d3.metric("Diferencia de ventana", f"{ot_diag['Diferencia_Ventana_Min']:.0f} min"
+                          if pd.notna(ot_diag['Diferencia_Ventana_Min']) else "N/A")
+
+                e1, e2, e3 = st.columns(3)
+                e1.metric("Producción Rechazo", f"{ot_diag['Producción de Rechazo']:.0f}")
+                e2.metric("Suma Defectos por tipo", f"{ot_diag['Suma_Defectos']:.0f}" if pd.notna(ot_diag['Suma_Defectos']) else "N/A")
+                e3.metric("Diferencia", f"{ot_diag['Diferencia_Defectos_vs_Rechazo']:.0f}" if pd.notna(ot_diag['Diferencia_Defectos_vs_Rechazo']) else "N/A")
+
+                f1, f2, f3 = st.columns(3)
+                f1.metric("Tiempo de Inactividad", f"{ot_diag['Inactivo_Min']:.0f} min" if pd.notna(ot_diag['Inactivo_Min']) else "N/A")
+                f2.metric("Suma Paros por causa", f"{ot_diag['Suma_Paros_Min']:.0f} min" if pd.notna(ot_diag['Suma_Paros_Min']) else "N/A")
+                f3.metric("Diferencia", f"{ot_diag['Diferencia_Paros_vs_Inactivo']:.0f} min" if pd.notna(ot_diag['Diferencia_Paros_vs_Inactivo']) else "N/A")
+
+                st.markdown("**Motivo(s) detectado(s):**")
+                if ot_diag['Diagnostico'] == "Sin inconsistencias detectadas":
+                    st.success("Sin inconsistencias detectadas para esta OT.")
+                else:
+                    for motivo in ot_diag['Diagnostico'].split(" | "):
+                        st.warning(f"• {motivo}")
+
+        st.download_button(
+            "⬇️ Descargar esta muestra en CSV",
+            data=df_muestra.to_csv(index=False).encode('utf-8'),
+            file_name="muestra_diagnostico_sec.csv",
+            mime="text/csv"
         )
 
     # ==========================================
