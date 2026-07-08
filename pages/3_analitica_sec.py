@@ -69,6 +69,12 @@ UMBRAL_VENTANA_MIN_HORAS = 2.0   # tolerancia mínima (horas) entre calendario y
 UMBRAL_VENTANA_PCT = 0.20        # tolerancia relativa (20% de la duración calendario)
 UMBRAL_PCT_CERO_SOSPECHOSO = 40.0  # % de lecturas en 0 dentro de la ventana a partir del cual el SEC se marca como sospechoso
 
+# Tolerancia (minutos) usada para volver a consultar energía dentro de cada sub-intervalo
+# "efectivo" de una OT ajustada por anidamiento. Se usa una tolerancia más chica que la
+# TOLERANCIA_MINUTOS normal para no volver a "tragarse" el tramo de la OT anidada que ya
+# se excluyó a propósito.
+TOLERANCIA_MINUTOS_SUBINTERVALO = 5
+
 # Posibles nombres de columnas dentro de energia.db, para tolerar variantes de esquema.
 ALIAS_COLUMNAS_ENERGIA = {
     'Timestamp': ['Timestamp', 'Fecha y hora', 'fecha_hora', 'timestamp', 'Fecha_Hora'],
@@ -366,8 +372,26 @@ def parsear_duracion_minutos(valor):
 # ==========================================
 # FUNCIONES DE CÁLCULO — ENERGÍA
 # ==========================================
-def calcular_metricas_ot(energia_ot, inicio_real, fin_real):
-    duracion_minutos = (fin_real - inicio_real).total_seconds() / 60.0
+def calcular_metricas_ot(energia_ot, inicio_real, fin_real, duracion_minutos_override=None, intervalos=None):
+    """
+    Calcula las métricas de energía/confiabilidad para una OT.
+
+    `duracion_minutos_override`: si se pasa, se usa como la duración "real" de la OT en
+    vez de (fin_real - inicio_real). Se usa cuando la OT fue ajustada por OTs anidadas:
+    la duración real ya no es el rango calendario completo, sino la suma de los
+    sub-intervalos efectivos (ver calcular_intervalos_efectivos).
+
+    `intervalos`: lista opcional de tuplas (inicio, fin) con los sub-intervalos
+    "efectivos" de esta OT (cuando se ajustó por anidamiento). Si se pasa, el cálculo de
+    Max_Gap_Min/Continuidad_Pct se hace POR SEPARADO dentro de cada sub-intervalo, en vez
+    de sobre toda la serie concatenada — así los huecos esperados ENTRE sub-intervalos
+    (que son justamente el tiempo en que corrió la OT anidada) no penalizan la
+    continuidad de esta OT.
+    """
+    if duracion_minutos_override is not None:
+        duracion_minutos = duracion_minutos_override
+    else:
+        duracion_minutos = (fin_real - inicio_real).total_seconds() / 60.0
     duracion_minutos_efectiva = max(duracion_minutos, 1.0)
     n_lecturas = len(energia_ot)
 
@@ -388,8 +412,25 @@ def calcular_metricas_ot(energia_ot, inicio_real, fin_real):
     minutos_cubiertos = energia_ot['Timestamp'].nunique()
     cobertura_pct = min(minutos_cubiertos / duracion_minutos_efectiva, 1.0) * 100
 
-    ts_ordenados = energia_ot['Timestamp'].sort_values().drop_duplicates()
-    max_gap = (ts_ordenados.diff().dropna().dt.total_seconds() / 60.0).max() if len(ts_ordenados) > 1 else max(duracion_minutos_efectiva - 1, 0)
+    if intervalos and len(intervalos) > 1:
+        # OT ajustada por anidamiento: se mide el hueco máximo DENTRO de cada
+        # sub-intervalo por separado, ignorando los huecos ENTRE sub-intervalos
+        # (esos son el tiempo excluido de la OT anidada, y son esperados).
+        gaps_por_intervalo = []
+        for a, b in intervalos:
+            ts_int = energia_ot.loc[
+                (energia_ot['Timestamp'] >= a) & (energia_ot['Timestamp'] <= b), 'Timestamp'
+            ].sort_values().drop_duplicates()
+            dur_int = max((b - a).total_seconds() / 60.0, 1.0)
+            if len(ts_int) > 1:
+                g = (ts_int.diff().dropna().dt.total_seconds() / 60.0).max()
+            else:
+                g = max(dur_int - 1, 0)
+            gaps_por_intervalo.append(g)
+        max_gap = max(gaps_por_intervalo) if gaps_por_intervalo else np.nan
+    else:
+        ts_ordenados = energia_ot['Timestamp'].sort_values().drop_duplicates()
+        max_gap = (ts_ordenados.diff().dropna().dt.total_seconds() / 60.0).max() if len(ts_ordenados) > 1 else max(duracion_minutos_efectiva - 1, 0)
 
     if max_gap <= 5:
         continuidad_pct = 100.0
@@ -455,6 +496,106 @@ def buscar_energia_ot(conn, tabla, mapa_col, maquina, inicio_real, fin_real, tol
     return df, inicio_span, fin_span
 
 
+# ==========================================
+# FUNCIONES DE CÁLCULO — OTs SUSPENDIDAS / ANIDADAS
+# ==========================================
+def detectar_ots_anidadas(df_prod_std, maquina_norm, id_job_actual, inicio_real, fin_real,
+                           tolerancia_min=TOLERANCIA_MINUTOS):
+    """
+    Busca otras OTs de la MISMA máquina cuyo rango de tiempo se traslape (total o
+    parcialmente) con [inicio_real, fin_real] de la OT actual.
+
+    Caso de uso: OTs suspendidas. El sistema no sabe explícitamente que una OT fue
+    suspendida, pero en la práctica esto se manifiesta como una OT cuya ventana
+    calendario (Fin−Inicio) es mucho más larga que su tiempo real reportado
+    (Tiempo de Actividad + Tiempo de Inactividad) — porque en el medio la máquina
+    corrió otra(s) OT(s) mientras esta esperaba para reactivarse.
+
+    Esta función devuelve esas OTs "intrusas" (recortadas al rango de la OT actual) para
+    que después se pueda restar su tiempo de la ventana grande y así no atribuirle a la
+    OT suspendida el consumo de energía de las órdenes que realmente corrieron en medio.
+
+    Devuelve una lista de tuplas (inicio_solape, fin_solape, id_job_intruso).
+    """
+    if df_prod_std is None or df_prod_std.empty:
+        return []
+
+    tol = pd.Timedelta(minutes=tolerancia_min)
+    df_m = df_prod_std[
+        (df_prod_std['ID_Maquina_Normalizado'] == maquina_norm) &
+        (df_prod_std['ID_Job'].astype(str) != str(id_job_actual))
+    ]
+    solapan = df_m[
+        (df_m['Inicio_Limpio'] < fin_real + tol) & (df_m['Fin_Limpio'] > inicio_real - tol)
+    ]
+
+    intervalos = []
+    for _, r in solapan.iterrows():
+        a = max(r['Inicio_Limpio'], inicio_real)
+        b = min(r['Fin_Limpio'], fin_real)
+        if b > a:
+            intervalos.append((a, b, str(r['ID_Job'])))
+    return intervalos
+
+
+def calcular_intervalos_efectivos(inicio_real, fin_real, intervalos_excluir):
+    """
+    Dado el rango grande [inicio_real, fin_real] de una OT (normalmente la "suspendida",
+    de mayor duración calendario) y una lista de intervalos (inicio, fin, id_job) que
+    representan OTs que corrieron en medio, calcula el COMPLEMENTO: los tramos de tiempo
+    dentro del rango grande que NO están cubiertos por ninguna de esas OTs intrusas. Esos
+    tramos son el tiempo en el que se asume que la OT original sí estuvo corriendo.
+
+    Los intervalos de exclusión que se traslapan entre sí se fusionan primero.
+    Devuelve una lista de tuplas (sub_inicio, sub_fin), ordenada cronológicamente.
+    """
+    if not intervalos_excluir:
+        return [(inicio_real, fin_real)]
+
+    ordenados = sorted([(a, b) for a, b, _ in intervalos_excluir], key=lambda x: x[0])
+    fusionados = []
+    for a, b in ordenados:
+        if fusionados and a <= fusionados[-1][1]:
+            fusionados[-1] = (fusionados[-1][0], max(fusionados[-1][1], b))
+        else:
+            fusionados.append((a, b))
+
+    efectivos = []
+    cursor = inicio_real
+    for a, b in fusionados:
+        if a > cursor:
+            efectivos.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < fin_real:
+        efectivos.append((cursor, fin_real))
+
+    return efectivos
+
+
+def buscar_energia_ot_multi(conn, tabla, mapa_col, maquina, intervalos,
+                             tolerancia_min=TOLERANCIA_MINUTOS_SUBINTERVALO):
+    """
+    Igual que buscar_energia_ot, pero para una lista de sub-intervalos "efectivos"
+    (usado cuando se excluyó el tiempo de OTs anidadas/suspensiones). Se usa una
+    tolerancia más chica por defecto (5 min) que la tolerancia normal, precisamente para
+    no volver a "tragarse" el tramo de la OT anidada que ya se excluyó a propósito.
+    Devuelve el DataFrame de energía concatenado, sin filas duplicadas por Timestamp.
+    """
+    partes = []
+    for inicio_sub, fin_sub in intervalos:
+        df_parte, _, _ = buscar_energia_ot(
+            conn, tabla, mapa_col, maquina, inicio_sub, fin_sub, tolerancia_min=tolerancia_min
+        )
+        partes.append(df_parte)
+
+    if not partes:
+        return pd.DataFrame(columns=['Timestamp', 'ID_Maquina_Texto', 'Energia_kWh', 'Potencia_kW'])
+
+    df_todas = pd.concat(partes, ignore_index=True)
+    df_todas = df_todas.drop_duplicates(subset=['Timestamp'])
+    return df_todas
+
+
 def listar_maquinas_energia_db(conn, tabla, mapa_col):
     """Máquinas distintas presentes en energia.db, sin traer ninguna otra columna ni fila completa."""
     col_maq = mapa_col['ID_Maquina_Texto']
@@ -502,17 +643,28 @@ def _agregar_linea_vertical(fig, x, texto, color, dash='dot'):
 
 
 def construir_grafico_energia_ot(df_energia_ot, inicio_real, fin_real, inicio_span, fin_span,
-                                  id_job_actual, df_prod_std, maquina_norm):
+                                  id_job_actual, df_prod_std, maquina_norm, intervalos_excluidos=None):
     """
     Gráfica de Potencia/Energía en el tiempo con líneas verticales marcando:
     - Inicio y Fin real de la OT (verde/rojo).
     - Inicio/Fin de cualquier OT vecina de la misma máquina que se traslape con la ventana
       consultada (naranja punteado), para detectar visualmente si la energía podría
       pertenecer parcialmente a otra orden.
+    - Si `intervalos_excluidos` se provee (tramos de OTs anidadas/suspensión que ya se
+      restaron del cálculo), se sombrean en gris para mostrar visualmente qué parte del
+      tiempo NO se le atribuyó a esta OT porque otra orden corrió ahí.
     No marca paros individuales: la fuente de datos solo trae el tiempo total y la cuenta
     por causa de paro para TODA la OT, no el instante exacto de cada uno.
     """
     fig = go.Figure()
+
+    if intervalos_excluidos:
+        for i, (a, b) in enumerate(intervalos_excluidos):
+            fig.add_vrect(
+                x0=a, x1=b, fillcolor='rgba(120,120,120,0.25)', line_width=0,
+                annotation_text='Excluido (OT anidada)' if i == 0 else None,
+                annotation_position='top left', layer='below'
+            )
 
     if not df_energia_ot.empty:
         df_plot = df_energia_ot.sort_values('Timestamp')
@@ -598,11 +750,18 @@ def agregar_columnas_diagnostico(df):
         motivos = []
         if not row['Ventana_Confiable']:
             dif = row.get('Diferencia_Ventana_Min', np.nan)
-            motivos.append(
+            base = (
                 f"Ventana de tiempo no confiable: el calendario (Fin−Inicio) difiere "
                 f"{dif:.0f} min del tiempo real (Actividad+Inactividad)" if pd.notna(dif)
                 else "Ventana de tiempo no confiable (faltan Tiempo de Actividad/Inactividad)"
             )
+            if row.get('N_OTs_Anidadas', 0) > 0:
+                base += (
+                    f". Se detectaron {int(row['N_OTs_Anidadas'])} OT(s) solapada(s) "
+                    f"({row.get('OTs_Anidadas_IDs', '')}) pero, incluso descontando su tiempo, "
+                    f"la ventana ajustada sigue sin cuadrar con Actividad+Inactividad"
+                )
+            motivos.append(base)
         elif row.get('N_Lecturas_Energia', 0) == 0:
             motivos.append("No se encontró ninguna lectura de energía para esa máquina en esa ventana de tiempo")
         elif row.get('SEC_Sospechoso', False):
@@ -928,9 +1087,11 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
             if n_ventana_no_confiable > 0:
                 st.warning(f"⚠️ {n_ventana_no_confiable} OTs tienen una diferencia grande entre el tiempo calendario "
                            f"(Fin−Inicio) y su tiempo real (Actividad+Inactividad) — probablemente la máquina corrió "
-                           f"otras órdenes en el medio. **Se excluyen del cruce de energía** para no contaminar el "
-                           f"cálculo de otras OTs (umbral: {UMBRAL_VENTANA_MIN_HORAS}h o {UMBRAL_VENTANA_PCT*100:.0f}% "
-                           f"de la duración, lo que sea mayor).")
+                           f"otras órdenes en el medio. Antes de descartarlas, se intentará **restar el tiempo de esas "
+                           f"OTs intrusas** y recalcular la ventana ajustada (ver más abajo cuántas se lograron "
+                           f"rescatar). Solo quedan totalmente excluidas las que ni así cuadran "
+                           f"(umbral: {UMBRAL_VENTANA_MIN_HORAS}h o {UMBRAL_VENTANA_PCT*100:.0f}% de la duración, "
+                           f"lo que sea mayor).")
 
             # --- MERGE PRODUCCIÓN + MASAS + COSTO ---
             st.write("🔗 Uniendo Producción, Masas y Costo Estándar...")
@@ -990,6 +1151,7 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
             st.write(f"🧠 Ejecutando emparejamiento con tolerancia temporal (±{TOLERANCIA_MINUTOS} min), "
                      f"consultando energia.db OT por OT (sin cargarlo completo)...")
             resultados_sec = []
+            n_ajustadas_por_anidamiento = 0
 
             for _, ot in df_consolidado.iterrows():
                 maquina_ot = ot['ID_Maquina_Normalizado']
@@ -1001,18 +1163,75 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
 
                 ventana_confiable = bool(ot['Ventana_Confiable'])
 
+                # --- Info de diagnóstico de anidamiento, por defecto "no aplica" ---
+                ajustada_por_anidamiento = False
+                n_ots_anidadas = 0
+                ots_anidadas_ids = ''
+                intervalos_efectivos = [(inicio_real, fin_real)]
+                diferencia_ventana_ajustada = np.nan
+
                 if ventana_confiable:
                     energia_ot, _, _ = buscar_energia_ot(
                         conn_energia, tabla_usada, mapa_col_energia, maquina_ot, inicio_real, fin_real
                     )
                 else:
-                    # No confiamos en el rango calendario: no buscamos energía para no
-                    # atribuirle a esta OT el consumo de otras órdenes intermedias.
-                    energia_ot = pd.DataFrame(columns=['Timestamp', 'ID_Maquina_Texto', 'Energia_kWh', 'Potencia_kW'])
+                    # La ventana calendario no cuadra con Actividad+Inactividad — posible OT
+                    # suspendida. Antes de descartarla, buscamos OTs de la misma máquina que
+                    # corrieron DENTRO de este rango y les restamos su tiempo.
+                    nested = detectar_ots_anidadas(df_prod, maquina_ot, ot['ID_Job'], inicio_real, fin_real)
 
-                metricas = calcular_metricas_ot(energia_ot, inicio_real, fin_real)
+                    if nested:
+                        n_ots_anidadas = len(set(j for _, _, j in nested))
+                        ots_anidadas_ids = ", ".join(sorted(set(j for _, _, j in nested)))
+                        intervalos_candidatos = calcular_intervalos_efectivos(inicio_real, fin_real, nested)
+
+                        duracion_ajustada_min = sum(
+                            (b - a).total_seconds() / 60.0 for a, b in intervalos_candidatos
+                        )
+                        if pd.notna(ot['Duracion_Real_Min']):
+                            diferencia_ventana_ajustada = abs(duracion_ajustada_min - ot['Duracion_Real_Min'])
+                            umbral_ajustado = max(
+                                UMBRAL_VENTANA_MIN_HORAS * 60, UMBRAL_VENTANA_PCT * max(duracion_ajustada_min, 1.0)
+                            )
+                        else:
+                            diferencia_ventana_ajustada = np.nan
+                            umbral_ajustado = np.nan
+
+                        if pd.notna(diferencia_ventana_ajustada) and diferencia_ventana_ajustada <= umbral_ajustado:
+                            # El ajuste sí cuadra: aceptamos esta OT como confiable y solo
+                            # consultamos energía dentro de los sub-intervalos efectivos.
+                            ventana_confiable = True
+                            ajustada_por_anidamiento = True
+                            intervalos_efectivos = intervalos_candidatos
+                            n_ajustadas_por_anidamiento += 1
+                            energia_ot = buscar_energia_ot_multi(
+                                conn_energia, tabla_usada, mapa_col_energia, maquina_ot, intervalos_efectivos
+                            )
+                        else:
+                            energia_ot = pd.DataFrame(
+                                columns=['Timestamp', 'ID_Maquina_Texto', 'Energia_kWh', 'Potencia_kW']
+                            )
+                    else:
+                        energia_ot = pd.DataFrame(
+                            columns=['Timestamp', 'ID_Maquina_Texto', 'Energia_kWh', 'Potencia_kW']
+                        )
+
+                if ajustada_por_anidamiento:
+                    duracion_override = sum(
+                        (b - a).total_seconds() / 60.0 for a, b in intervalos_efectivos
+                    )
+                    metricas = calcular_metricas_ot(
+                        energia_ot, inicio_real, fin_real,
+                        duracion_minutos_override=duracion_override,
+                        intervalos=intervalos_efectivos
+                    )
+                else:
+                    metricas = calcular_metricas_ot(energia_ot, inicio_real, fin_real)
+
                 if not ventana_confiable:
                     metricas['Confiabilidad'] = 'Sin Ventana Confiable'
+                elif ajustada_por_anidamiento:
+                    metricas['Confiabilidad'] = metricas['Confiabilidad'] + ' (Ajustada)'
 
                 masa_total_kg = ot['Total_Masa_Kg'] if pd.notna(ot['Total_Masa_Kg']) else np.nan
                 prod_total = ot['Producción Total']
@@ -1050,6 +1269,13 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
 
                 fila_resultado = ot.to_dict()
                 fila_resultado.update(metricas)
+                fila_resultado['Ventana_Confiable'] = ventana_confiable
+                fila_resultado['Ajustada_Por_OTs_Anidadas'] = ajustada_por_anidamiento
+                fila_resultado['N_OTs_Anidadas'] = n_ots_anidadas
+                fila_resultado['OTs_Anidadas_IDs'] = ots_anidadas_ids
+                fila_resultado['Diferencia_Ventana_Ajustada_Min'] = (
+                    round(diferencia_ventana_ajustada, 1) if pd.notna(diferencia_ventana_ajustada) else np.nan
+                )
                 fila_resultado['Masa_Buena_Kg'] = round(masa_buena_kg, 3) if pd.notna(masa_buena_kg) else np.nan
                 fila_resultado['Energia_Activa_Estimada_kWh'] = round(energia_activa_kwh, 3) if pd.notna(energia_activa_kwh) else np.nan
                 fila_resultado['Energia_Parada_Estimada_kWh'] = round(energia_parada_kwh, 3) if pd.notna(energia_parada_kwh) else np.nan
@@ -1062,6 +1288,11 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
                 resultados_sec.append(fila_resultado)
 
             df_resultado_final = pd.DataFrame(resultados_sec)
+
+            if n_ajustadas_por_anidamiento > 0:
+                st.success(f"✅ {n_ajustadas_por_anidamiento} OTs con ventana no confiable se pudieron **rescatar** "
+                           f"restando el tiempo de OTs anidadas (posible suspensión) — quedaron con "
+                           f"`Ventana_Confiable = True` y `Ajustada_Por_OTs_Anidadas = True`.")
 
             st.write("🩺 Calculando diagnóstico de convergencia (defectos, paros, ventanas)...")
             df_resultado_final = agregar_columnas_diagnostico(df_resultado_final)
@@ -1090,13 +1321,16 @@ if 'df_sec_calculado' in st.session_state:
     n_total_ots = len(df_board)
     n_viables = int(df_board['SEC_Viable'].sum())
     n_no_viables = n_total_ots - n_viables
+    n_ajustadas_total = int(df_board['Ajustada_Por_OTs_Anidadas'].sum()) if 'Ajustada_Por_OTs_Anidadas' in df_board.columns else 0
 
     st.markdown(
         f"**{n_viables} de {n_total_ots} OTs** ({(n_viables/n_total_ots*100 if n_total_ots else 0):.0f}%) "
-        f"tienen datos de energía viables y ya muestran su SEC calculado."
+        f"tienen datos de energía viables y ya muestran su SEC calculado. "
+        f"De esas, **{n_ajustadas_total}** se rescataron descontando el tiempo de OTs anidadas "
+        f"(posible suspensión)."
     )
 
-    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+    col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
     with col1:
         maquinas = ['Todas'] + sorted(df_board['ID_Maquina_Normalizado'].dropna().unique().tolist())
         filtro_maq = st.selectbox("🏭 Máquina:", maquinas)
@@ -1117,6 +1351,8 @@ if 'df_sec_calculado' in st.session_state:
         )
     with col6:
         solo_sospechoso = st.checkbox(f"🕵️ Solo SEC sospechoso (>{UMBRAL_PCT_CERO_SOSPECHOSO:.0f}% ceros)", value=False)
+    with col8:
+        solo_ajustadas = st.checkbox("🩹 Solo OTs rescatadas (anidamiento)", value=False)
 
     if filtro_maq != 'Todas':
         df_board = df_board[df_board['ID_Maquina_Normalizado'] == filtro_maq]
@@ -1134,6 +1370,8 @@ if 'df_sec_calculado' in st.session_state:
         df_board = df_board[~df_board['SEC_Viable']]
     if solo_sospechoso:
         df_board = df_board[df_board['SEC_Sospechoso']]
+    if solo_ajustadas:
+        df_board = df_board[df_board['Ajustada_Por_OTs_Anidadas'] == True]
 
     # Las OTs con SEC viable van primero, para que salten a la vista de inmediato.
     df_board = df_board.sort_values('SEC_Viable', ascending=False)
@@ -1148,7 +1386,7 @@ if 'df_sec_calculado' in st.session_state:
     masa_total = df_board['Total_Masa_Kg'].sum()
     sec_promedio = df_board['Energia_Total_kWh'].sum() / masa_total if masa_total > 0 else 0
     kpi6.metric("SEC Total Promedio (kWh/kg)", f"{sec_promedio:.4f}")
-    pct_alta = (df_board['Confiabilidad'] == 'Alta').mean() * 100 if len(df_board) > 0 else 0
+    pct_alta = df_board['Confiabilidad'].str.startswith('Alta').mean() * 100 if len(df_board) > 0 else 0
     kpi7.metric("% OTs Confiabilidad Alta", f"{pct_alta:.0f}%")
 
     st.markdown("#### SEC en sus 3 variantes")
@@ -1178,9 +1416,11 @@ if 'df_sec_calculado' in st.session_state:
     df_tabla = df_board.copy()
     df_tabla['SEC_Viable'] = df_tabla['SEC_Viable'].map({True: '✅ Sí', False: '🚫 No'})
     df_tabla['SEC_Sospechoso'] = df_tabla['SEC_Sospechoso'].map({True: '🕵️ Sí', False: '—'})
+    df_tabla['Ajustada_Por_OTs_Anidadas'] = df_tabla['Ajustada_Por_OTs_Anidadas'].map({True: '🩹 Sí', False: '—'})
 
     st.dataframe(
-        df_tabla[['SEC_Viable', 'SEC_Sospechoso', 'ID_Job', 'ID_Maquina', 'ID_Molde', 'Inicio_Limpio', 'Fin_Limpio',
+        df_tabla[['SEC_Viable', 'SEC_Sospechoso', 'Ajustada_Por_OTs_Anidadas', 'N_OTs_Anidadas', 'OTs_Anidadas_IDs',
+                   'ID_Job', 'ID_Maquina', 'ID_Molde', 'Inicio_Limpio', 'Fin_Limpio',
                    'Total_Masa_Kg', 'Masa_Buena_Kg', 'Energia_Total_kWh', 'Pct_Lecturas_Cero',
                    'SEC_Total_kWh_kg', 'SEC_Inyeccion_kWh_kg', 'SEC_Conforme_kWh_kg',
                    'Producción de Rechazo', 'Costo_No_Conformidad', 'Energia_Desperdiciada_Rechazo_kWh',
@@ -1192,9 +1432,18 @@ if 'df_sec_calculado' in st.session_state:
     if n_no_viables > 0:
         st.caption(
             f"ℹ️ Las {n_no_viables} OTs marcadas con 🚫 no tienen SEC calculado porque: no se encontró ninguna "
-            f"lectura de energía en su ventana de tiempo, la ventana de tiempo no era confiable (columna "
-            f"`Ventana_Confiable` = False), o no tienen masa asociada > 0. Usa el Inspector de Orden de abajo "
-            f"para ver la razón exacta de cada caso."
+            f"lectura de energía en su ventana de tiempo, la ventana de tiempo no era confiable ni siquiera "
+            f"restando el tiempo de OTs anidadas (columna `Ventana_Confiable` = False), o no tienen masa "
+            f"asociada > 0. Usa el Inspector de Orden de abajo para ver la razón exacta de cada caso."
+        )
+    if n_ajustadas_total > 0:
+        st.caption(
+            f"🩹 Las OTs marcadas como **Ajustada_Por_OTs_Anidadas** tenían originalmente una ventana calendario "
+            f"que no cuadraba con Actividad+Inactividad (posible suspensión). Se detectaron otras OTs de la misma "
+            f"máquina corriendo dentro de ese rango, se les restó su tiempo, y con eso la ventana ajustada sí "
+            f"cuadró — así que su SEC se calculó solo con la energía de los tramos en que esta OT realmente "
+            f"parece haber estado corriendo. Revisa la columna `OTs_Anidadas_IDs` para ver cuáles fueron, y la "
+            f"gráfica de energía en el Inspector de Orden (se sombrean en gris los tramos excluidos)."
         )
     if int(df_board['SEC_Sospechoso'].sum()) > 0:
         st.caption(
@@ -1227,6 +1476,7 @@ if 'df_sec_calculado' in st.session_state:
                 "⚠️ Solo con defectos que no cuadran",
                 "⚠️ Solo con paros que no cuadran",
                 "⚠️ Solo con ventana no confiable",
+                "🩹 Solo rescatadas por OTs anidadas",
                 "🎲 Aleatoria",
                 "📋 Las primeras N (tal como vienen)",
             ]
@@ -1247,6 +1497,8 @@ if 'df_sec_calculado' in st.session_state:
         df_muestra = df_diag[~df_diag['Paros_Cuadran']].head(int(tamano_muestra))
     elif estrategia_muestra == "⚠️ Solo con ventana no confiable":
         df_muestra = df_diag[~df_diag['Ventana_Confiable']].head(int(tamano_muestra))
+    elif estrategia_muestra == "🩹 Solo rescatadas por OTs anidadas":
+        df_muestra = df_diag[df_diag['Ajustada_Por_OTs_Anidadas']].head(int(tamano_muestra))
     elif estrategia_muestra == "🎲 Aleatoria":
         df_muestra = df_diag.sample(n=min(int(tamano_muestra), len(df_diag)), random_state=None) if len(df_diag) > 0 else df_diag
     else:  # primeras N tal como vienen
@@ -1258,6 +1510,7 @@ if 'df_sec_calculado' in st.session_state:
         st.markdown(f"#### Resumen de la muestra ({len(df_muestra)} OTs)")
         st.dataframe(
             df_muestra[['ID_Job', 'ID_Maquina', 'ID_Molde', 'SEC_Viable', 'Ventana_Confiable', 'Diferencia_Ventana_Min',
+                        'Ajustada_Por_OTs_Anidadas', 'N_OTs_Anidadas', 'OTs_Anidadas_IDs',
                         'Produccion_Cuadra', 'Defectos_Cuadran', 'Diferencia_Defectos_vs_Rechazo',
                         'Paros_Cuadran', 'Diferencia_Paros_vs_Inactivo', 'N_Problemas_Detectados', 'Diagnostico']],
             use_container_width=True
@@ -1274,6 +1527,11 @@ if 'df_sec_calculado' in st.session_state:
                           if pd.notna(ot_diag['Duracion_Real_Min']) else "N/A")
                 d3.metric("Diferencia de ventana", f"{ot_diag['Diferencia_Ventana_Min']:.0f} min"
                           if pd.notna(ot_diag['Diferencia_Ventana_Min']) else "N/A")
+
+                if ot_diag['Ajustada_Por_OTs_Anidadas']:
+                    st.info(f"🩹 Ventana rescatada restando {int(ot_diag['N_OTs_Anidadas'])} OT(s) anidada(s): "
+                            f"**{ot_diag['OTs_Anidadas_IDs']}** (diferencia ajustada: "
+                            f"{ot_diag['Diferencia_Ventana_Ajustada_Min']:.0f} min).")
 
                 e1, e2, e3 = st.columns(3)
                 e1.metric("Producción Rechazo", f"{ot_diag['Producción de Rechazo']:.0f}")
@@ -1295,17 +1553,44 @@ if 'df_sec_calculado' in st.session_state:
                 if ot_diag['Ventana_Confiable']:
                     inicio_real_diag = pd.to_datetime(ot_diag['Inicio_Limpio'])
                     fin_real_diag = pd.to_datetime(ot_diag['Fin_Limpio'])
-                    energia_ot_diag, inicio_span_diag, fin_span_diag = buscar_energia_ot(
-                        conn_energia, tabla_usada, mapa_col_energia,
-                        ot_diag['ID_Maquina_Normalizado'], inicio_real_diag, fin_real_diag
-                    )
+                    df_prod_std_diag = st.session_state.get('df_prod_std')
+
+                    intervalos_excluidos_diag = None
+                    if ot_diag['Ajustada_Por_OTs_Anidadas']:
+                        nested_diag = detectar_ots_anidadas(
+                            df_prod_std_diag, ot_diag['ID_Maquina_Normalizado'], ot_diag['ID_Job'],
+                            inicio_real_diag, fin_real_diag
+                        )
+                        intervalos_efectivos_diag = calcular_intervalos_efectivos(inicio_real_diag, fin_real_diag, nested_diag)
+                        # Los tramos EXCLUIDOS son el complemento de los efectivos dentro del rango.
+                        intervalos_excluidos_diag = []
+                        cursor = inicio_real_diag
+                        for a, b in intervalos_efectivos_diag:
+                            if a > cursor:
+                                intervalos_excluidos_diag.append((cursor, a))
+                            cursor = b
+                        if cursor < fin_real_diag:
+                            pass  # nada que excluir al final si el último tramo efectivo llega hasta el final
+                        energia_ot_diag = buscar_energia_ot_multi(
+                            conn_energia, tabla_usada, mapa_col_energia,
+                            ot_diag['ID_Maquina_Normalizado'], intervalos_efectivos_diag
+                        )
+                        inicio_span_diag = inicio_real_diag
+                        fin_span_diag = fin_real_diag
+                    else:
+                        energia_ot_diag, inicio_span_diag, fin_span_diag = buscar_energia_ot(
+                            conn_energia, tabla_usada, mapa_col_energia,
+                            ot_diag['ID_Maquina_Normalizado'], inicio_real_diag, fin_real_diag
+                        )
+
                     g1, g2 = st.columns(2)
                     g1.metric("SEC Total", f"{ot_diag['SEC_Total_kWh_kg']:.4f} kWh/kg" if pd.notna(ot_diag['SEC_Total_kWh_kg']) else "N/A")
                     g2.metric("% minutos en 0 kWh", f"{ot_diag['Pct_Lecturas_Cero']:.0f}%" if pd.notna(ot_diag['Pct_Lecturas_Cero']) else "N/A")
 
                     fig_diag, n_vecinas_diag = construir_grafico_energia_ot(
                         energia_ot_diag, inicio_real_diag, fin_real_diag, inicio_span_diag, fin_span_diag,
-                        ot_diag['ID_Job'], st.session_state.get('df_prod_std'), ot_diag['ID_Maquina_Normalizado']
+                        ot_diag['ID_Job'], df_prod_std_diag, ot_diag['ID_Maquina_Normalizado'],
+                        intervalos_excluidos=intervalos_excluidos_diag
                     )
                     st.plotly_chart(fig_diag, use_container_width=True)
                     if n_vecinas_diag > 0:
@@ -1348,6 +1633,12 @@ if 'df_sec_calculado' in st.session_state:
             st.error(f"🚫 Esta OT tiene ventana **no confiable**: la diferencia entre tiempo calendario y tiempo real "
                      f"(Activo+Inactivo) es de {fila_ot['Diferencia_Ventana_Min']:.0f} minutos. No se buscó energía "
                      f"para evitar atribuirle consumo de otra orden.")
+        if fila_ot.get('Ajustada_Por_OTs_Anidadas', False):
+            st.info(f"🩹 Esta OT tenía originalmente una ventana no confiable, pero se rescató restando el tiempo "
+                    f"de {int(fila_ot['N_OTs_Anidadas'])} OT(s) anidada(s) que corrieron en medio "
+                    f"(posible suspensión): **{fila_ot['OTs_Anidadas_IDs']}**. La energía y el SEC de esta OT solo "
+                    f"consideran los tramos de tiempo en que ella parece haber estado corriendo — mira la pestaña "
+                    f"⚡ Energía para ver la gráfica con los tramos excluidos sombreados en gris.")
         if fila_ot.get('Solape_Ventana_Energia', False):
             st.warning("⚠️ Esta orden tiene su ventana de energía traslapada con la OT anterior en la misma máquina.")
         if not fila_ot.get('Produccion_Cuadra', True):
@@ -1386,9 +1677,28 @@ if 'df_sec_calculado' in st.session_state:
                 maquina_norm = fila_ot['ID_Maquina_Normalizado']
                 inicio_real = pd.to_datetime(fila_ot['Inicio_Limpio'])
                 fin_real = pd.to_datetime(fila_ot['Fin_Limpio'])
-                energia_ot, inicio_span, fin_span = buscar_energia_ot(
-                    conn_insp, tabla_insp, mapa_col_insp, maquina_norm, inicio_real, fin_real
-                )
+                df_prod_para_grafico = st.session_state.get('df_prod_std')
+
+                intervalos_excluidos_insp = None
+                if fila_ot.get('Ajustada_Por_OTs_Anidadas', False):
+                    nested_insp = detectar_ots_anidadas(
+                        df_prod_para_grafico, maquina_norm, id_job_elegido, inicio_real, fin_real
+                    )
+                    intervalos_efectivos_insp = calcular_intervalos_efectivos(inicio_real, fin_real, nested_insp)
+                    intervalos_excluidos_insp = []
+                    cursor = inicio_real
+                    for a, b in intervalos_efectivos_insp:
+                        if a > cursor:
+                            intervalos_excluidos_insp.append((cursor, a))
+                        cursor = b
+                    energia_ot = buscar_energia_ot_multi(
+                        conn_insp, tabla_insp, mapa_col_insp, maquina_norm, intervalos_efectivos_insp
+                    )
+                    inicio_span, fin_span = inicio_real, fin_real
+                else:
+                    energia_ot, inicio_span, fin_span = buscar_energia_ot(
+                        conn_insp, tabla_insp, mapa_col_insp, maquina_norm, inicio_real, fin_real
+                    )
 
                 st.caption(f"Ventana real: **{inicio_real} → {fin_real}**. Con tolerancia (±{TOLERANCIA_MINUTOS} min): "
                            f"**{inicio_span} → {fin_span}**.")
@@ -1402,11 +1712,11 @@ if 'df_sec_calculado' in st.session_state:
 
                 st.markdown("**Comportamiento de energía durante la OT** (líneas verdes/rojas = inicio/fin de "
                             "esta OT; líneas naranjas = inicio/fin de otra OT de la misma máquina que se traslapa "
-                            "con esta ventana):")
-                df_prod_para_grafico = st.session_state.get('df_prod_std')
+                            "con esta ventana; sombreado gris = tramo excluido por pertenecer a una OT anidada):")
                 fig_energia, n_vecinas = construir_grafico_energia_ot(
                     energia_ot, inicio_real, fin_real, inicio_span, fin_span,
-                    id_job_elegido, df_prod_para_grafico, maquina_norm
+                    id_job_elegido, df_prod_para_grafico, maquina_norm,
+                    intervalos_excluidos=intervalos_excluidos_insp
                 )
                 st.plotly_chart(fig_energia, use_container_width=True)
                 if n_vecinas > 0:
@@ -1490,14 +1800,16 @@ if 'df_sec_calculado' in st.session_state:
             score = fila_ot['Score_Confiabilidad']
 
             st.markdown(f"""
-- **Duración de la OT (calendario):** {duracion:.1f} minutos
+- **Duración de la OT (calendario):** {fila_ot['Duracion_Calendario_Min']:.1f} minutos
+- **Duración considerada para el SEC (ajustada si aplica):** {duracion:.1f} minutos
 - **Minutos con al menos 1 lectura de energía:** {cubiertos} → **Cobertura = {cobertura:.1f}%**
-- **Mayor hueco (gap) sin lecturas:** {gap:.1f} min → **Continuidad = {continuidad:.1f}%**
+- **Mayor hueco (gap) sin lecturas dentro de un mismo tramo:** {gap:.1f} min → **Continuidad = {continuidad:.1f}%**
 - **Score final = Cobertura × 0.5 + Continuidad × 0.5 = {score:.3f}**
 - **Etiqueta:** Alta (≥0.85) / Media (≥0.60) / Baja (resto) / Sin Ventana Confiable → **{fila_ot['Confiabilidad']}**
+- **Ajustada por OTs anidadas:** {"Sí — " + fila_ot['OTs_Anidadas_IDs'] if fila_ot.get('Ajustada_Por_OTs_Anidadas', False) else "No"}
 
 **Cómo se calculan las 3 variantes de SEC:**
-- `SEC_Total_kWh_kg` = Energía Total consumida en la ventana ÷ Masa Total transformada
+- `SEC_Total_kWh_kg` = Energía Total consumida en la ventana (o en los tramos efectivos, si fue ajustada) ÷ Masa Total transformada
 - `SEC_Inyeccion_kWh_kg` = Energía estimada durante Tiempo de Actividad ÷ Masa Total transformada
 - `SEC_Conforme_kWh_kg` = Energía Total consumida (activa + parada) ÷ Masa **Buena** (excluyendo el rechazo)
 """)
