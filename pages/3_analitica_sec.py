@@ -47,6 +47,14 @@ HOJA_COSTO_PREFERIDA = "Maestra Costo Estandar"
 # interpretar mal la coma como separador de miles y convertir '409,65' en 40965.
 COLUMNAS_MASAS_FORZAR_TEXTO = ['Total']
 
+# Posibles nombres de columna en la hoja de Producción que identifican el Molde/Herramienta
+# usado en la OT. Se busca de forma case-insensitive; si ninguna coincide, se le pide al
+# usuario que la seleccione manualmente (ver sección 1).
+ALIAS_COLUMNA_MOLDE = [
+    'Molde', 'ID Molde', 'ID_Molde', 'Número de Molde', 'Numero de Molde',
+    'No. Molde', 'N° Molde', 'Herramienta', 'Tool', 'Tool ID'
+]
+
 TOLERANCIA_MINUTOS = 15          # margen de tolerancia temporal para emparejar energía
 EPOCH_EXCEL_DURACION = dt.date(1899, 12, 31)  # base para reconstruir duraciones > 24h mal formateadas por Excel
 UMBRAL_VENTANA_MIN_HORAS = 2.0   # tolerancia mínima (horas) entre calendario y (activo+inactivo)
@@ -710,6 +718,20 @@ if faltantes_costo:
 st.success(f"Datos base descargados: {len(df_prod_raw)} OTs de Producción, {len(df_masas_raw)} registros de Materiales "
            f"y {len(df_costo_raw)} referencias de Costo Estándar.")
 
+# --- Detección de la columna de Molde/Herramienta (opcional, para trazabilidad) ---
+columna_molde_detectada = next(
+    (c for c in df_prod_raw.columns if c.strip().lower() in [a.lower() for a in ALIAS_COLUMNA_MOLDE]),
+    None
+)
+if columna_molde_detectada:
+    st.success(f"✅ Columna de Molde detectada en Producción: **{columna_molde_detectada}** "
+               f"(se mostrará como `ID_Molde` en los resultados).")
+else:
+    with st.expander("🔧 No se detectó automáticamente una columna de Molde — selecciona manualmente (opcional)"):
+        opciones_molde = ['(Ninguna)'] + list(df_prod_raw.columns)
+        seleccion_molde = st.selectbox("Columna que representa el Molde/Herramienta:", opciones_molde)
+        columna_molde_detectada = None if seleccion_molde == '(Ninguna)' else seleccion_molde
+
 # --- Diagnóstico visual del parseo de 'Total' (masas) — para confirmar que ya no se
 #     interpreta mal la coma decimal (ej. '409,65' ya no se vuelve 40965). ---
 with st.expander("🔬 Diagnóstico de lectura de 'Total' (columna de Masas)"):
@@ -787,6 +809,13 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
             }, inplace=True)
             df_prod['ID_Job'] = df_prod['ID_Job'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
             df_prod['ID_Parte'] = df_prod['ID_Parte'].astype(str).str.strip()
+
+            # --- Columna de Molde (detectada/seleccionada en la sección 1) ---
+            if columna_molde_detectada and columna_molde_detectada in df_prod.columns:
+                df_prod.rename(columns={columna_molde_detectada: 'ID_Molde'}, inplace=True)
+                df_prod['ID_Molde'] = df_prod['ID_Molde'].astype(str).str.strip()
+            else:
+                df_prod['ID_Molde'] = 'N/D'
 
             df_prod['Inicio_Limpio'] = pd.to_datetime(df_prod['Inicio'], errors='coerce', format='mixed', dayfirst=True)
             # Esto también captura los 'Current' (OTs aún en curso, sin fecha de fin real)
@@ -1050,10 +1079,13 @@ if 'df_sec_calculado' in st.session_state:
         f"tienen datos de energía viables y ya muestran su SEC calculado."
     )
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
     with col1:
         maquinas = ['Todas'] + sorted(df_board['ID_Maquina_Normalizado'].dropna().unique().tolist())
         filtro_maq = st.selectbox("🏭 Máquina:", maquinas)
+    with col7:
+        moldes = ['Todos'] + sorted(df_board['ID_Molde'].dropna().unique().tolist())
+        filtro_molde = st.selectbox("🧰 Molde:", moldes)
     with col2:
         confiabilidades = ['Todas'] + sorted(df_board['Confiabilidad'].dropna().unique().tolist())
         filtro_conf = st.selectbox("🎯 Confiabilidad del Dato:", confiabilidades)
@@ -1071,6 +1103,8 @@ if 'df_sec_calculado' in st.session_state:
 
     if filtro_maq != 'Todas':
         df_board = df_board[df_board['ID_Maquina_Normalizado'] == filtro_maq]
+    if filtro_molde != 'Todos':
+        df_board = df_board[df_board['ID_Molde'] == filtro_molde]
     if filtro_conf != 'Todas':
         df_board = df_board[df_board['Confiabilidad'] == filtro_conf]
     if solo_solapes:
@@ -1129,7 +1163,7 @@ if 'df_sec_calculado' in st.session_state:
     df_tabla['SEC_Sospechoso'] = df_tabla['SEC_Sospechoso'].map({True: '🕵️ Sí', False: '—'})
 
     st.dataframe(
-        df_tabla[['SEC_Viable', 'SEC_Sospechoso', 'ID_Job', 'ID_Maquina', 'Inicio_Limpio', 'Fin_Limpio',
+        df_tabla[['SEC_Viable', 'SEC_Sospechoso', 'ID_Job', 'ID_Maquina', 'ID_Molde', 'Inicio_Limpio', 'Fin_Limpio',
                    'Total_Masa_Kg', 'Masa_Buena_Kg', 'Energia_Total_kWh', 'Pct_Lecturas_Cero',
                    'SEC_Total_kWh_kg', 'SEC_Inyeccion_kWh_kg', 'SEC_Conforme_kWh_kg',
                    'Producción de Rechazo', 'Costo_No_Conformidad', 'Energia_Desperdiciada_Rechazo_kWh',
@@ -1206,7 +1240,7 @@ if 'df_sec_calculado' in st.session_state:
     else:
         st.markdown(f"#### Resumen de la muestra ({len(df_muestra)} OTs)")
         st.dataframe(
-            df_muestra[['ID_Job', 'ID_Maquina', 'SEC_Viable', 'Ventana_Confiable', 'Diferencia_Ventana_Min',
+            df_muestra[['ID_Job', 'ID_Maquina', 'ID_Molde', 'SEC_Viable', 'Ventana_Confiable', 'Diferencia_Ventana_Min',
                         'Produccion_Cuadra', 'Defectos_Cuadran', 'Diferencia_Defectos_vs_Rechazo',
                         'Paros_Cuadran', 'Diferencia_Paros_vs_Inactivo', 'N_Problemas_Detectados', 'Diagnostico']],
             use_container_width=True
@@ -1283,7 +1317,8 @@ if 'df_sec_calculado' in st.session_state:
         id_job_elegido = st.selectbox("ID_Job a inspeccionar:", ids_disponibles)
         fila_ot = df_board[df_board['ID_Job'] == id_job_elegido].iloc[0]
 
-        st.markdown(f"### Orden `{id_job_elegido}` — Máquina `{fila_ot['ID_Maquina']}`")
+        st.markdown(f"### Orden `{id_job_elegido}` — Máquina `{fila_ot['ID_Maquina']}` "
+                    f"— Molde `{fila_ot.get('ID_Molde', 'N/D')}`")
 
         ic1, ic2, ic3, ic4, ic5 = st.columns(5)
         ic1.metric("Masa Total (Kg)", f"{fila_ot['Total_Masa_Kg']:.2f}")
