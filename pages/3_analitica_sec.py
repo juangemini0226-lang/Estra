@@ -41,6 +41,12 @@ HOJA_PROD_PREFERIDA = "produccion detallada"
 HOJA_MASAS_PREFERIDA = "Material_Data"
 HOJA_COSTO_PREFERIDA = "Maestra Costo Estandar"
 
+# Columnas numéricas de la hoja de Masas que deben leerse como TEXTO crudo (sin el
+# 'numericise' automático de gspread), porque están en formato latino (coma = decimal,
+# ej. '409,65'). Si se deja que gspread las numericise automáticamente, puede
+# interpretar mal la coma como separador de miles y convertir '409,65' en 40965.
+COLUMNAS_MASAS_FORZAR_TEXTO = ['Total']
+
 TOLERANCIA_MINUTOS = 15          # margen de tolerancia temporal para emparejar energía
 EPOCH_EXCEL_DURACION = dt.date(1899, 12, 31)  # base para reconstruir duraciones > 24h mal formateadas por Excel
 UMBRAL_VENTANA_MIN_HORAS = 2.0   # tolerancia mínima (horas) entre calendario y (activo+inactivo)
@@ -90,11 +96,35 @@ def detectar_hoja(info_hojas, columnas_requeridas):
 
 
 @st.cache_data(ttl=600)
-def descargar_hoja(nombre_hoja):
+def descargar_hoja(nombre_hoja, columnas_forzar_texto=None):
+    """
+    Descarga una hoja completa como DataFrame.
+
+    `columnas_forzar_texto`: lista opcional de nombres de columna que deben leerse SIN
+    el 'numericise' automático de gspread. Por defecto, gspread intenta convertir
+    cualquier celda que "parezca número" a int/float usando reglas estilo EE.UU. (coma
+    = separador de miles, punto = decimal). Si una columna numérica está en formato
+    latino (coma = decimal, ej. '409,65'), gspread puede interpretarla mal ANTES de que
+    nuestro propio código la vea, convirtiendo '409,65' en el entero 40965. Forzar estas
+    columnas a texto crudo evita esa conversión prematura, para poder parsearlas
+    nosotros mismos con la función `parsear_numero_latino`.
+    """
     gc = conectar_sheets()
     sh = gc.open_by_url(SHEET_URL)
     ws = sh.worksheet(nombre_hoja)  # SIEMPRE por nombre, nunca por posición
-    return pd.DataFrame(ws.get_all_records())
+
+    if columnas_forzar_texto:
+        encabezados = ws.row_values(1)
+        # numericise_ignore de gspread espera índices de columna 1-based.
+        indices_forzados = [
+            i + 1 for i, nombre in enumerate(encabezados)
+            if nombre.strip() in columnas_forzar_texto
+        ]
+        registros = ws.get_all_records(numericise_ignore=indices_forzados)
+    else:
+        registros = ws.get_all_records()
+
+    return pd.DataFrame(registros)
 
 
 # ==========================================
@@ -194,6 +224,52 @@ def normalizar_maquina(id_maquina):
     texto = str(id_maquina).strip().upper()
     if texto.endswith('MED'): return texto[:-3]
     return texto
+
+
+def parsear_numero_latino(valor):
+    """
+    Convierte a float un valor numérico que puede venir en distintos formatos:
+
+    - Ya numérico (int/float, cuando gspread SÍ lo pudo numericise correctamente
+      porque no había ambigüedad) -> se devuelve tal cual.
+    - Texto en formato latino: coma como separador decimal, punto opcional como
+      separador de miles. Ej: '409,65' -> 409.65 | '1.234,56' -> 1234.56
+    - Texto en formato US: punto como separador decimal, coma opcional como
+      separador de miles. Ej: '409.65' -> 409.65 | '1,234.56' -> 1234.56
+
+    Cuando el texto tiene AMBOS separadores, se asume que el que aparece más a la
+    derecha es el decimal real (es el que está más cerca del final del número), y el
+    otro se trata como separador de miles y se elimina. Cuando solo tiene coma, se
+    asume formato latino (coma = decimal), que es el que usa este archivo de origen.
+    """
+    if valor is None:
+        return np.nan
+    if isinstance(valor, (int, float, np.integer, np.floating)):
+        return float(valor) if pd.notna(valor) else np.nan
+
+    texto = str(valor).strip()
+    if texto == '' or texto.lower() in ('nan', 'none'):
+        return np.nan
+
+    tiene_coma = ',' in texto
+    tiene_punto = '.' in texto
+
+    if tiene_coma and tiene_punto:
+        if texto.rfind(',') > texto.rfind('.'):
+            # La coma está más a la derecha -> es el decimal; el punto era de miles.
+            texto = texto.replace('.', '').replace(',', '.')
+        else:
+            # El punto está más a la derecha -> es el decimal; la coma era de miles.
+            texto = texto.replace(',', '')
+    elif tiene_coma:
+        # Solo coma presente -> formato latino, coma = decimal.
+        texto = texto.replace(',', '.')
+    # Si solo tiene punto (o ningún separador), se deja tal cual.
+
+    try:
+        return float(texto)
+    except ValueError:
+        return np.nan
 
 
 def clasificar_unidad_masa(descripcion, total):
@@ -606,7 +682,9 @@ with col_c:
 
 with st.spinner(f"Descargando '{hoja_prod_elegida}', '{hoja_masas_elegida}' y '{hoja_costo_elegida}'..."):
     df_prod_raw = descargar_hoja(hoja_prod_elegida)
-    df_masas_raw = descargar_hoja(hoja_masas_elegida)
+    # FIX: forzamos 'Total' a texto crudo para que gspread no lo numericise mal
+    # (ver docstring de descargar_hoja y parsear_numero_latino).
+    df_masas_raw = descargar_hoja(hoja_masas_elegida, columnas_forzar_texto=COLUMNAS_MASAS_FORZAR_TEXTO)
     df_costo_raw = descargar_hoja(hoja_costo_elegida)
 
 if df_prod_raw.empty or df_masas_raw.empty:
@@ -631,6 +709,19 @@ if faltantes_costo:
 
 st.success(f"Datos base descargados: {len(df_prod_raw)} OTs de Producción, {len(df_masas_raw)} registros de Materiales "
            f"y {len(df_costo_raw)} referencias de Costo Estándar.")
+
+# --- Diagnóstico visual del parseo de 'Total' (masas) — para confirmar que ya no se
+#     interpreta mal la coma decimal (ej. '409,65' ya no se vuelve 40965). ---
+with st.expander("🔬 Diagnóstico de lectura de 'Total' (columna de Masas)"):
+    muestra_total_cruda = df_masas_raw[['ID_Job', 'Descripcion', 'Total']].head(8).copy()
+    muestra_total_cruda['Tipo dato crudo'] = df_masas_raw['Total'].head(8).apply(lambda v: type(v).__name__)
+    muestra_total_cruda['Total interpretado (kg equiv.)'] = df_masas_raw['Total'].head(8).apply(parsear_numero_latino)
+    st.write("Muestra de las primeras 8 filas: valor crudo tal como llega de Google Sheets vs. cómo se interpreta:")
+    st.dataframe(muestra_total_cruda, use_container_width=True)
+    st.caption("Si aquí ves, por ejemplo, un crudo `409,65` interpretado como `409.65` (no como `40965`), el "
+               "parseo está funcionando correctamente. Si el valor crudo YA llega como un número tipo `int`/`float` "
+               "sin coma (ej. `40965`), significa que el dato se corrompió antes de llegar aquí — revisa el formato "
+               "de la celda directamente en Google Sheets para esa fila.")
 
 # ==========================================
 # 2. CONSUMO ENERGÉTICO — AHORA DESDE energia.db EN DRIVE (consulta SQL, sin cargar todo a memoria)
@@ -751,8 +842,10 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
             st.write("⚖️ Clasificando y consolidando Masas por ID_Job (filtrando por unidad)...")
             df_masas = df_masas_raw.copy()
             df_masas['ID_Job'] = df_masas['ID_Job'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-            df_masas['Total'] = df_masas['Total'].astype(str).str.replace(',', '.', regex=False)
-            df_masas['Total'] = pd.to_numeric(df_masas['Total'], errors='coerce')
+            # FIX: usamos el parser robusto de números latinos/US en vez del replace(',', '.')
+            # a secas, que dependía de que el valor todavía fuera texto con coma al llegar
+            # aquí (cosa que gspread ya no garantiza si numericisa la columna antes).
+            df_masas['Total'] = df_masas['Total'].apply(parsear_numero_latino)
 
             clasificacion = df_masas.apply(
                 lambda row: clasificar_unidad_masa(row['Descripcion'], row['Total']), axis=1
