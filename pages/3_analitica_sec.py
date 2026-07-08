@@ -48,11 +48,19 @@ HOJA_COSTO_PREFERIDA = "Maestra Costo Estandar"
 COLUMNAS_MASAS_FORZAR_TEXTO = ['Total']
 
 # Posibles nombres de columna en la hoja de Producción que identifican el Molde/Herramienta
-# usado en la OT. Se busca de forma case-insensitive; si ninguna coincide, se le pide al
-# usuario que la seleccione manualmente (ver sección 1).
+# usado en la OT. El nombre confirmado en la hoja real es 'Molde' (primer alias); se deja
+# la lista de variantes por si cambia en el futuro. Búsqueda case-insensitive; si ninguna
+# coincide, se le pide al usuario que la seleccione manualmente (ver sección 1).
 ALIAS_COLUMNA_MOLDE = [
     'Molde', 'ID Molde', 'ID_Molde', 'Número de Molde', 'Numero de Molde',
     'No. Molde', 'N° Molde', 'Herramienta', 'Tool', 'Tool ID'
+]
+
+# Igual que arriba, pero para la columna con el nombre/descripción legible del molde
+# (ej. 'BALDE C/ESCURRIDOR...'). Confirmado en la hoja real como 'Descripción Molde'.
+# Esta es opcional: si no se detecta, simplemente no se muestra (no bloquea el cálculo).
+ALIAS_COLUMNA_MOLDE_DESC = [
+    'Descripción Molde', 'Descripcion Molde', 'Molde Descripcion', 'Nombre Molde'
 ]
 
 TOLERANCIA_MINUTOS = 15          # margen de tolerancia temporal para emparejar energía
@@ -731,6 +739,15 @@ else:
         opciones_molde = ['(Ninguna)'] + list(df_prod_raw.columns)
         seleccion_molde = st.selectbox("Columna que representa el Molde/Herramienta:", opciones_molde)
         columna_molde_detectada = None if seleccion_molde == '(Ninguna)' else seleccion_molde
+
+# --- Detección de la columna de Descripción del Molde (opcional, solo informativa) ---
+columna_molde_desc_detectada = next(
+    (c for c in df_prod_raw.columns if c.strip().lower() in [a.lower() for a in ALIAS_COLUMNA_MOLDE_DESC]),
+    None
+)
+if columna_molde_desc_detectada:
+    st.caption(f"ℹ️ También se detectó la descripción del molde en la columna **{columna_molde_desc_detectada}** "
+               f"(se mostrará como `ID_Molde_Descripcion`).")
 
 # --- Diagnóstico visual del parseo de 'Total' (masas) — para confirmar que ya no se
 #     interpreta mal la coma decimal (ej. '409,65' ya no se vuelve 40965). ---
