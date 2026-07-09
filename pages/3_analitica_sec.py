@@ -834,6 +834,89 @@ def agregar_columnas_diagnostico(df):
 
 
 # ==========================================
+# EXPORTACIÓN A GOOGLE SHEETS — HOJA "Analisis_SEC" (para BI / analítica externa)
+# ==========================================
+NOMBRE_HOJA_ANALISIS = "Analisis_SEC"
+
+# Columnas más representativas del resultado, pensadas para consumo en un BI (Power BI,
+# Looker Studio, Sheets con tablas dinámicas, etc.) o análisis directo en Sheets. Se
+# mantiene un set curado (no TODAS las ~80 columnas internas) para que la hoja sea liviana
+# y fácil de modelar. Si una columna no existe en el resultado (por ejemplo porque no se
+# detectó columna de Molde), simplemente se omite sin romper la exportación.
+COLUMNAS_ANALISIS_SEC = [
+    'ID_Job', 'ID_Maquina', 'ID_Maquina_Normalizado', 'ID_Molde', 'ID_Molde_Descripcion', 'ID_Parte',
+    'Inicio_Limpio', 'Fin_Limpio',
+    'Duracion_Calendario_Min', 'Duracion_Real_Min', 'Activo_Min', 'Inactivo_Min',
+    'Total_Masa_Kg', 'Masa_Buena_Kg',
+    'Producción Total', 'Producción Buena', 'Producción de Rechazo',
+    'Energia_Total_kWh', 'Energia_Activa_Estimada_kWh', 'Energia_Parada_Estimada_kWh', 'Energia_Parada_Pct',
+    'SEC_Total_kWh_kg', 'SEC_Inyeccion_kWh_kg', 'SEC_Conforme_kWh_kg',
+    'Costo_Unitario_Estandar', 'Costo_No_Conformidad', 'Energia_Desperdiciada_Rechazo_kWh',
+    'Cobertura_Pct', 'Continuidad_Pct', 'Pct_Lecturas_Cero', 'Confiabilidad', 'Score_Confiabilidad',
+    'SEC_Viable', 'SEC_Sospechoso',
+    'Ventana_Confiable', 'Ajustada_Por_OTs_Anidadas', 'N_OTs_Anidadas', 'OTs_Anidadas_IDs',
+    'Anidamiento_Sospechoso', 'Diferencia_Multiplo_24h', 'Es_Sospechoso',
+    'Solape_Ventana_Energia', 'Produccion_Cuadra', 'Defectos_Cuadran', 'Paros_Cuadran',
+    'N_Problemas_Detectados', 'Diagnostico',
+]
+
+
+def _preparar_df_para_sheets(df):
+    """
+    Deja el DataFrame listo para subir con gspread: fechas como texto ISO, NaN/inf como
+    None (celda vacía), y todo lo demás como tipos nativos de Python (gspread no acepta
+    tipos numpy directamente en algunas versiones).
+    """
+    df = df.copy()
+    for c in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            df[c] = df[c].dt.strftime('%Y-%m-%d %H:%M:%S')
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.astype(object).where(pd.notna(df), None)
+    # Convierte bool/numpy numérico a tipos nativos de Python.
+    for c in df.columns:
+        df[c] = df[c].map(lambda v: bool(v) if isinstance(v, (np.bool_,)) else v)
+        df[c] = df[c].map(lambda v: float(v) if isinstance(v, (np.floating,)) else v)
+        df[c] = df[c].map(lambda v: int(v) if isinstance(v, (np.integer,)) else v)
+    return df
+
+
+def exportar_a_analisis_sec(df_resultado, sheet_url=SHEET_URL, nombre_hoja=NOMBRE_HOJA_ANALISIS):
+    """
+    Escribe una selección de columnas "listas para BI" del resultado del cruce SEC en una
+    pestaña dedicada del mismo Google Sheet (se crea si no existe; si ya existe, se limpia
+    y se reemplaza por completo con el resultado más reciente — así siempre queda 1
+    fuente de verdad actualizada, en vez de ir acumulando exportaciones duplicadas).
+    Devuelve (n_filas, n_columnas, url_hoja).
+    """
+    gc = conectar_sheets()
+    sh = gc.open_by_url(sheet_url)
+
+    cols_presentes = [c for c in COLUMNAS_ANALISIS_SEC if c in df_resultado.columns]
+    df_export = df_resultado[cols_presentes].copy()
+    df_export = _preparar_df_para_sheets(df_export)
+
+    n_filas, n_cols = len(df_export), len(cols_presentes)
+
+    try:
+        ws = sh.worksheet(nombre_hoja)
+        ws.clear()
+        # Asegura suficientes filas/columnas para el volumen actual de datos.
+        filas_necesarias = n_filas + 10
+        cols_necesarias = n_cols + 2
+        if ws.row_count < filas_necesarias or ws.col_count < cols_necesarias:
+            ws.resize(rows=max(ws.row_count, filas_necesarias), cols=max(ws.col_count, cols_necesarias))
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=nombre_hoja, rows=str(n_filas + 10), cols=str(n_cols + 2))
+
+    valores = [cols_presentes] + df_export.values.tolist()
+    ws.update(values=valores, range_name='A1', value_input_option='USER_ENTERED')
+
+    url_hoja = f"{sheet_url.split('/edit')[0]}/edit#gid={ws.id}"
+    return n_filas, n_cols, url_hoja
+
+
+# ==========================================
 # 1. RESOLUCIÓN DE HOJAS
 # ==========================================
 st.markdown("### 1. Extracción de Datos Maestros")
@@ -1028,6 +1111,13 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
             else:
                 df_prod['ID_Molde'] = 'N/D'
 
+            # --- Descripción del Molde (opcional, solo informativa/trazabilidad) ---
+            if columna_molde_desc_detectada and columna_molde_desc_detectada in df_prod.columns:
+                df_prod.rename(columns={columna_molde_desc_detectada: 'ID_Molde_Descripcion'}, inplace=True)
+                df_prod['ID_Molde_Descripcion'] = df_prod['ID_Molde_Descripcion'].astype(str).str.strip()
+            else:
+                df_prod['ID_Molde_Descripcion'] = 'N/D'
+
             df_prod['Inicio_Limpio'] = pd.to_datetime(df_prod['Inicio'], errors='coerce', format='mixed', dayfirst=True)
             # Esto también captura los 'Current' (OTs aún en curso, sin fecha de fin real)
             df_prod['Fin_Limpio'] = pd.to_datetime(df_prod['Fin'], errors='coerce', format='mixed', dayfirst=True)
@@ -1185,10 +1275,17 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
             # --- CRUCE FINAL (MOTOR SEC) ---
             st.write(f"🧠 Ejecutando emparejamiento con tolerancia temporal (±{TOLERANCIA_MINUTOS} min), "
                      f"consultando energia.db OT por OT (sin cargarlo completo)...")
+            barra_progreso = st.progress(0.0, text="Procesando OTs...")
             resultados_sec = []
             n_ajustadas_por_anidamiento = 0
+            total_ots_a_procesar = len(df_consolidado)
 
-            for _, ot in df_consolidado.iterrows():
+            for idx_ot, (_, ot) in enumerate(df_consolidado.iterrows()):
+                if total_ots_a_procesar > 0 and idx_ot % 50 == 0:
+                    barra_progreso.progress(
+                        min(idx_ot / total_ots_a_procesar, 1.0),
+                        text=f"Procesando OTs... ({idx_ot}/{total_ots_a_procesar})"
+                    )
                 maquina_ot = ot['ID_Maquina_Normalizado']
                 inicio_real = ot['Inicio_Limpio']
                 fin_real = ot['Fin_Limpio']
@@ -1337,6 +1434,7 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
                 fila_resultado['Energia_Desperdiciada_Rechazo_kWh'] = energia_desperdiciada_rechazo
                 resultados_sec.append(fila_resultado)
 
+            barra_progreso.progress(1.0, text="Procesamiento de OTs completado.")
             df_resultado_final = pd.DataFrame(resultados_sec)
 
             if n_ajustadas_por_anidamiento > 0:
@@ -1374,14 +1472,28 @@ if 'df_sec_calculado' in st.session_state:
     n_ajustadas_total = int(df_board['Ajustada_Por_OTs_Anidadas'].sum()) if 'Ajustada_Por_OTs_Anidadas' in df_board.columns else 0
     n_sospechosos_total = int(df_board['Es_Sospechoso'].sum()) if 'Es_Sospechoso' in df_board.columns else 0
 
-    st.markdown(
-        f"**{n_viables} de {n_total_ots} OTs** ({(n_viables/n_total_ots*100 if n_total_ots else 0):.0f}%) "
-        f"tienen datos de energía viables y ya muestran su SEC calculado. "
-        f"De esas, **{n_ajustadas_total}** se rescataron descontando el tiempo de OTs anidadas "
-        f"(posible suspensión), y de esas, **{n_sospechosos_total}** quedaron marcadas como 🚩 "
-        f"**sospechosas** (revisar si son suspensiones reales o errores de datos — no se bloquearon, "
-        f"solo se señalan)."
-    )
+    # --- Barra superior: resumen + exportación a Google Sheets para BI ---
+    res_col, exp_col = st.columns([3, 1])
+    with res_col:
+        st.markdown(
+            f"**{n_viables} de {n_total_ots} OTs** ({(n_viables/n_total_ots*100 if n_total_ots else 0):.0f}%) "
+            f"tienen datos de energía viables y ya muestran su SEC calculado. "
+            f"De esas, **{n_ajustadas_total}** se rescataron descontando el tiempo de OTs anidadas "
+            f"(posible suspensión), y de esas, **{n_sospechosos_total}** quedaron marcadas como 🚩 "
+            f"**sospechosas** (revisar si son suspensiones reales o errores de datos — no se bloquearon, "
+            f"solo se señalan)."
+        )
+    with exp_col:
+        if st.button("📤 Exportar a 'Analisis_SEC' (BI)", use_container_width=True,
+                      help="Sube las columnas más representativas del resultado a una pestaña dedicada del "
+                           "mismo Google Sheet, lista para conectar a Power BI, Looker Studio o tablas dinámicas."):
+            with st.spinner("Escribiendo hoja 'Analisis_SEC' en Google Sheets..."):
+                try:
+                    n_filas_exp, n_cols_exp, url_hoja_exp = exportar_a_analisis_sec(df_board)
+                    st.success(f"✅ Se exportaron {n_filas_exp} filas × {n_cols_exp} columnas a la pestaña "
+                               f"**{NOMBRE_HOJA_ANALISIS}**. [Abrir la hoja]({url_hoja_exp})")
+                except Exception as e_export:
+                    st.error(f"❌ No se pudo exportar a Google Sheets: {e_export}")
 
     col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns(9)
     with col1:
@@ -1470,6 +1582,75 @@ if 'df_sec_calculado' in st.session_state:
     n2.metric("⚡ Energía en Rechazo", f"{energia_nc_total:,.2f} kWh")
     n3.metric("📦 Unidades Rechazadas", f"{rechazo_total:,.0f}")
 
+    # --- Gráficos analíticos: dan una lectura rápida sin tener que leer la tabla completa ---
+    st.markdown("#### Vistas Analíticas")
+    g_tab1, g_tab2, g_tab3, g_tab4 = st.tabs(
+        ["🏭 SEC por Máquina", "📈 Tendencia de SEC en el Tiempo", "📊 Distribución del SEC", "🎯 Confiabilidad"]
+    )
+
+    df_viable = df_board[df_board['SEC_Viable']].copy()
+
+    with g_tab1:
+        if df_viable.empty:
+            st.info("No hay OTs con SEC viable en el filtro actual.")
+        else:
+            resumen_maq = df_viable.groupby('ID_Maquina_Normalizado').agg(
+                Energia_Total_kWh=('Energia_Total_kWh', 'sum'),
+                Masa_Total_Kg=('Total_Masa_Kg', 'sum'),
+                N_OTs=('ID_Job', 'count')
+            ).reset_index()
+            resumen_maq['SEC_kWh_kg'] = resumen_maq['Energia_Total_kWh'] / resumen_maq['Masa_Total_Kg'].replace(0, np.nan)
+            resumen_maq = resumen_maq.sort_values('SEC_kWh_kg', ascending=False)
+            fig_maq = px.bar(
+                resumen_maq, x='ID_Maquina_Normalizado', y='SEC_kWh_kg',
+                color='SEC_kWh_kg', color_continuous_scale='Oranges',
+                hover_data={'Energia_Total_kWh': ':.1f', 'Masa_Total_Kg': ':.1f', 'N_OTs': True},
+                labels={'ID_Maquina_Normalizado': 'Máquina', 'SEC_kWh_kg': 'SEC (kWh/kg)'}
+            )
+            fig_maq.update_layout(height=420, margin=dict(l=10, r=10, t=20, b=10), coloraxis_showscale=False)
+            st.plotly_chart(fig_maq, use_container_width=True)
+
+    with g_tab2:
+        if df_viable.empty:
+            st.info("No hay OTs con SEC viable en el filtro actual.")
+        else:
+            df_tendencia = df_viable.copy()
+            df_tendencia['Fecha'] = pd.to_datetime(df_tendencia['Inicio_Limpio']).dt.date
+            resumen_fecha = df_tendencia.groupby('Fecha').agg(
+                Energia_Total_kWh=('Energia_Total_kWh', 'sum'),
+                Masa_Total_Kg=('Total_Masa_Kg', 'sum')
+            ).reset_index()
+            resumen_fecha['SEC_kWh_kg'] = resumen_fecha['Energia_Total_kWh'] / resumen_fecha['Masa_Total_Kg'].replace(0, np.nan)
+            fig_tend = px.line(
+                resumen_fecha, x='Fecha', y='SEC_kWh_kg', markers=True,
+                labels={'Fecha': 'Fecha', 'SEC_kWh_kg': 'SEC (kWh/kg)'}
+            )
+            fig_tend.update_traces(line=dict(color='#1f77b4', width=2))
+            fig_tend.update_layout(height=420, margin=dict(l=10, r=10, t=20, b=10))
+            st.plotly_chart(fig_tend, use_container_width=True)
+
+    with g_tab3:
+        if df_viable.empty:
+            st.info("No hay OTs con SEC viable en el filtro actual.")
+        else:
+            fig_hist = px.histogram(
+                df_viable, x='SEC_Total_kWh_kg', nbins=40,
+                labels={'SEC_Total_kWh_kg': 'SEC Total (kWh/kg)'}
+            )
+            fig_hist.update_traces(marker_color='#2ca02c')
+            fig_hist.add_vline(x=df_viable['SEC_Total_kWh_kg'].median(), line_dash='dash', line_color='red',
+                                annotation_text='Mediana', annotation_position='top right')
+            fig_hist.update_layout(height=420, margin=dict(l=10, r=10, t=20, b=10))
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+    with g_tab4:
+        resumen_conf = df_board['Confiabilidad'].value_counts().reset_index()
+        resumen_conf.columns = ['Confiabilidad', 'N_OTs']
+        fig_conf = px.pie(resumen_conf, names='Confiabilidad', values='N_OTs', hole=0.45)
+        fig_conf.update_layout(height=420, margin=dict(l=10, r=10, t=20, b=10))
+        st.plotly_chart(fig_conf, use_container_width=True)
+
+    st.markdown("#### Tabla Detallada")
     df_tabla = df_board.copy()
     df_tabla['SEC_Viable'] = df_tabla['SEC_Viable'].map({True: '✅ Sí', False: '🚫 No'})
     df_tabla['SEC_Sospechoso'] = df_tabla['SEC_Sospechoso'].map({True: '🕵️ Sí', False: '—'})
@@ -1485,8 +1666,24 @@ if 'df_sec_calculado' in st.session_state:
                    'Producción de Rechazo', 'Costo_No_Conformidad', 'Energia_Desperdiciada_Rechazo_kWh',
                    'Cobertura_Pct', 'Continuidad_Pct', 'Confiabilidad', 'Ventana_Confiable',
                    'Solape_Ventana_Energia', 'Produccion_Cuadra']],
-        use_container_width=True
+        use_container_width=True,
+        height=420,
+        column_config={
+            'SEC_Total_kWh_kg': st.column_config.NumberColumn('SEC Total', format="%.4f"),
+            'SEC_Inyeccion_kWh_kg': st.column_config.NumberColumn('SEC Inyección', format="%.4f"),
+            'SEC_Conforme_kWh_kg': st.column_config.NumberColumn('SEC Conforme', format="%.4f"),
+            'Energia_Total_kWh': st.column_config.NumberColumn('Energía (kWh)', format="%.2f"),
+            'Total_Masa_Kg': st.column_config.NumberColumn('Masa Total (Kg)', format="%.2f"),
+            'Masa_Buena_Kg': st.column_config.NumberColumn('Masa Buena (Kg)', format="%.2f"),
+            'Cobertura_Pct': st.column_config.ProgressColumn('Cobertura %', format="%.0f%%", min_value=0, max_value=100),
+            'Continuidad_Pct': st.column_config.ProgressColumn('Continuidad %', format="%.0f%%", min_value=0, max_value=100),
+            'Costo_No_Conformidad': st.column_config.NumberColumn('Costo No Conf.', format="$%.0f"),
+        }
     )
+
+    csv_tabla = df_board.to_csv(index=False).encode('utf-8')
+    st.download_button("⬇️ Descargar tabla filtrada en CSV", data=csv_tabla,
+                        file_name="tablero_sec.csv", mime="text/csv")
 
     if n_no_viables > 0:
         st.caption(
@@ -1523,11 +1720,12 @@ if 'df_sec_calculado' in st.session_state:
         )
 
     # ==========================================
-    # 🗓️ LÍNEA DE TIEMPO POR MÁQUINA (GANTT)
+    # 🗓️ LÍNEA DE TIEMPO / GANTT (todas las máquinas, estilo planificador de proyecto)
     # ==========================================
     st.divider()
-    st.markdown("## 🗓️ Línea de Tiempo por Máquina")
-    st.write("Todas las OTs de una máquina en su línea de tiempo real. Las barras que se traslapan horizontalmente "
+    st.markdown("## 🗓️ Línea de Tiempo (Gantt)")
+    st.write("Todas las OTs de las máquinas seleccionadas en su línea de tiempo real, en un solo Gantt tipo "
+             "planificador de proyecto. Las barras que se traslapan horizontalmente dentro de la misma fila "
              "son la señal visual de una posible suspensión: una OT grande con otra(s) corriendo en el medio.")
 
     df_prod_gantt = st.session_state.get('df_prod_std')
@@ -1536,35 +1734,71 @@ if 'df_sec_calculado' in st.session_state:
     if df_prod_gantt is None or df_prod_gantt.empty:
         st.info("Corre el cálculo SEC primero para poder ver la línea de tiempo.")
     else:
-        maquinas_gantt = sorted(df_prod_gantt['ID_Maquina_Normalizado'].dropna().unique().tolist())
-        gcol1, gcol2 = st.columns([1, 2])
+        fecha_min_global = df_prod_gantt['Inicio_Limpio'].min()
+        fecha_max_global = df_prod_gantt['Fin_Limpio'].max()
+
+        # --- Filtros rápidos de periodo (día / semana / mes / trimestre / año / personalizado) ---
+        gcol1, gcol2 = st.columns([1.3, 2])
         with gcol1:
-            maquina_gantt_sel = st.selectbox("🏭 Máquina a visualizar:", maquinas_gantt, key="maquina_gantt_sel")
-
-        df_maq = df_prod_gantt[df_prod_gantt['ID_Maquina_Normalizado'] == maquina_gantt_sel].copy()
-        fecha_min = df_maq['Inicio_Limpio'].min()
-        fecha_max = df_maq['Fin_Limpio'].max()
-
-        with gcol2:
-            rango_fechas = st.date_input(
-                "📅 Rango de fechas a mostrar:",
-                value=(fecha_min.date(), fecha_max.date()),
-                min_value=fecha_min.date(),
-                max_value=fecha_max.date(),
-                key="rango_gantt"
+            vista_rapida = st.radio(
+                "📅 Vista rápida:",
+                ["Semana actual", "Mes actual", "Trimestre actual", "Año actual", "Todo", "Personalizado"],
+                horizontal=False, key="vista_rapida_gantt"
             )
 
-        if isinstance(rango_fechas, tuple) and len(rango_fechas) == 2:
-            desde = pd.Timestamp(rango_fechas[0])
-            hasta = pd.Timestamp(rango_fechas[1]) + pd.Timedelta(days=1)
-            df_maq = df_maq[(df_maq['Inicio_Limpio'] < hasta) & (df_maq['Fin_Limpio'] >= desde)]
+        hoy = pd.Timestamp.now().normalize()
+        if vista_rapida == "Semana actual":
+            desde_g = hoy - pd.Timedelta(days=hoy.weekday())
+            hasta_g = desde_g + pd.Timedelta(days=7)
+        elif vista_rapida == "Mes actual":
+            desde_g = hoy.replace(day=1)
+            hasta_g = (desde_g + pd.DateOffset(months=1))
+        elif vista_rapida == "Trimestre actual":
+            trimestre = (hoy.month - 1) // 3
+            desde_g = pd.Timestamp(year=hoy.year, month=trimestre * 3 + 1, day=1)
+            hasta_g = desde_g + pd.DateOffset(months=3)
+        elif vista_rapida == "Año actual":
+            desde_g = pd.Timestamp(year=hoy.year, month=1, day=1)
+            hasta_g = desde_g + pd.DateOffset(years=1)
+        elif vista_rapida == "Todo":
+            desde_g = pd.Timestamp(fecha_min_global.date())
+            hasta_g = pd.Timestamp(fecha_max_global.date()) + pd.Timedelta(days=1)
+        else:
+            with gcol2:
+                rango_personalizado = st.date_input(
+                    "Rango de fechas personalizado:",
+                    value=(fecha_min_global.date(), fecha_max_global.date()),
+                    min_value=fecha_min_global.date(),
+                    max_value=fecha_max_global.date(),
+                    key="rango_gantt_personalizado"
+                )
+            if isinstance(rango_personalizado, tuple) and len(rango_personalizado) == 2:
+                desde_g = pd.Timestamp(rango_personalizado[0])
+                hasta_g = pd.Timestamp(rango_personalizado[1]) + pd.Timedelta(days=1)
+            else:
+                desde_g = pd.Timestamp(fecha_min_global.date())
+                hasta_g = pd.Timestamp(fecha_max_global.date()) + pd.Timedelta(days=1)
+
+        if vista_rapida != "Personalizado":
+            with gcol2:
+                st.caption(f"Mostrando: **{desde_g.date()} → {(hasta_g - pd.Timedelta(days=1)).date()}**")
+
+        # --- Selección de máquinas (multiselección; por defecto todas, con aviso si son demasiadas) ---
+        maquinas_gantt_todas = sorted(df_prod_gantt['ID_Maquina_Normalizado'].dropna().unique().tolist())
+        maquinas_gantt_sel = st.multiselect(
+            "🏭 Máquinas a incluir:", maquinas_gantt_todas,
+            default=maquinas_gantt_todas, key="maquinas_gantt_sel"
+        )
+
+        df_maq = df_prod_gantt[df_prod_gantt['ID_Maquina_Normalizado'].isin(maquinas_gantt_sel)].copy()
+        df_maq = df_maq[(df_maq['Inicio_Limpio'] < hasta_g) & (df_maq['Fin_Limpio'] >= desde_g)]
 
         if df_maq.empty:
-            st.info("No hay OTs de esta máquina en el rango de fechas seleccionado.")
+            st.info("No hay OTs para las máquinas y el rango de fechas seleccionados.")
         else:
-            if len(df_maq) > 300:
-                st.warning(f"⚠️ Hay {len(df_maq)} OTs en este rango — la gráfica puede ser difícil de leer. "
-                           f"Considera acortar el rango de fechas.")
+            if len(df_maq) > 600:
+                st.warning(f"⚠️ Hay {len(df_maq)} OTs en este rango/selección — la gráfica puede ser difícil de "
+                           f"leer. Considera acortar el rango de fechas o filtrar menos máquinas.")
 
             cols_info = ['ID_Job', 'Confiabilidad', 'Ajustada_Por_OTs_Anidadas', 'Anidamiento_Sospechoso',
                          'Diferencia_Multiplo_24h', 'SEC_Total_kWh_kg', 'Ventana_Confiable']
@@ -1592,6 +1826,7 @@ if 'df_sec_calculado' in st.session_state:
                 return '✅ SEC calculado normal'
 
             df_maq['Categoria'] = df_maq.apply(_categoria_gantt, axis=1)
+            # Paleta estilo planificador de proyecto: verde = normal, rojo = requiere revisión.
             color_map = {
                 '✅ SEC calculado normal': '#2ca02c',
                 '🩹 Ajustada por anidamiento': '#1f77b4',
@@ -1600,28 +1835,57 @@ if 'df_sec_calculado' in st.session_state:
                 '⬜ Sin SEC (sin masa u otro dato)': '#c7c7c7',
             }
 
-            df_maq_sorted = df_maq.sort_values('Inicio_Limpio').copy()
+            # Orden de filas: por máquina y luego cronológico dentro de cada máquina (como en el
+            # planificador de referencia, cada máquina es una fila con sus OTs en secuencia).
+            df_maq_sorted = df_maq.sort_values(['ID_Maquina_Normalizado', 'Inicio_Limpio']).copy()
             df_maq_sorted['ID_Job_Label'] = df_maq_sorted['ID_Job'].astype(str)
+            df_maq_sorted['Etiqueta_Barra'] = df_maq_sorted['ID_Job_Label']
             hover_cols = [c for c in ['Confiabilidad', 'SEC_Total_kWh_kg'] if c in df_maq_sorted.columns]
 
+            orden_maquinas = sorted(df_maq_sorted['ID_Maquina_Normalizado'].unique().tolist())
+
             fig_gantt = px.timeline(
-                df_maq_sorted, x_start='Inicio_Limpio', x_end='Fin_Limpio', y='ID_Job_Label',
-                color='Categoria', color_discrete_map=color_map, hover_data=hover_cols
+                df_maq_sorted, x_start='Inicio_Limpio', x_end='Fin_Limpio', y='ID_Maquina_Normalizado',
+                color='Categoria', color_discrete_map=color_map, hover_data=hover_cols,
+                text='Etiqueta_Barra'
             )
+            fig_gantt.update_traces(
+                textposition='inside', insidetextanchor='start',
+                textfont=dict(color='white', size=11),
+                marker_line_color='rgba(0,0,0,0.35)', marker_line_width=1
+            )
+
+            # Marcadores tipo "diamante" al inicio de cada OT, como hitos, para reforzar
+            # visualmente los puntos de arranque (igual al estilo del planificador de referencia).
+            fig_gantt.add_trace(go.Scatter(
+                x=df_maq_sorted['Inicio_Limpio'], y=df_maq_sorted['ID_Maquina_Normalizado'],
+                mode='markers', marker=dict(symbol='diamond', size=9, color='#2ca02c',
+                                             line=dict(color='white', width=1)),
+                name='Inicio de OT', showlegend=True, hoverinfo='skip'
+            ))
+
             fig_gantt.update_yaxes(
-                categoryorder='array', categoryarray=df_maq_sorted['ID_Job_Label'].tolist()[::-1], title=None
+                categoryorder='array', categoryarray=orden_maquinas[::-1], title=None
             )
+            fig_gantt.update_xaxes(range=[desde_g, hasta_g], title=None,
+                                    rangeslider_visible=(len(df_maq_sorted) > 0),
+                                    showgrid=True, gridcolor='rgba(0,0,0,0.08)')
             fig_gantt.update_layout(
-                height=max(400, min(24 * len(df_maq_sorted), 1200)),
+                height=max(420, min(30 * len(orden_maquinas) + 100, 1200)),
                 margin=dict(l=10, r=10, t=30, b=10),
                 legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
-                xaxis_title=None,
+                bargap=0.35,
+                plot_bgcolor='white',
             )
             st.plotly_chart(fig_gantt, use_container_width=True)
-            st.caption("Cada barra es una OT. Si ves barras traslapadas horizontalmente, esa máquina corrió más "
-                       "de una OT al mismo tiempo — es la señal visual de una suspensión. 🔵 Azul = ya ajustada "
-                       "automáticamente. 🔴 Rojo = ajuste sospechoso, revisar a mano. ⚫ Gris oscuro = ventana no "
-                       "confiable sin poder ajustar (sin OTs anidadas que restar).")
+            st.caption("Cada barra es una OT (con su ID dentro), agrupadas por máquina en filas, igual que un "
+                       "planificador de proyecto. Los diamantes marcan el inicio de cada OT. Si ves barras "
+                       "traslapadas dentro de una misma fila, esa máquina corrió más de una OT al mismo "
+                       "tiempo — es la señal visual de una suspensión. 🟢 Verde = SEC calculado normal. "
+                       "🔵 Azul = ya ajustada automáticamente. 🔴 Rojo = ajuste sospechoso, revisar a mano. "
+                       "⚫ Gris oscuro = ventana no confiable sin poder ajustar. Usa el control deslizante debajo "
+                       "del eje para navegar dentro del rango, o cambia la 'Vista rápida' para saltar entre "
+                       "semana/mes/trimestre/año.")
 
     # ==========================================
     # 🩺 DIAGNÓSTICO DE CONVERGENCIA — muestra acotada de OTs
