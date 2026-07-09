@@ -9,6 +9,7 @@ import tempfile
 import datetime as dt
 import gspread
 import plotly.graph_objects as go
+import plotly.express as px
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -74,6 +75,14 @@ UMBRAL_PCT_CERO_SOSPECHOSO = 40.0  # % de lecturas en 0 dentro de la ventana a p
 # TOLERANCIA_MINUTOS normal para no volver a "tragarse" el tramo de la OT anidada que ya
 # se excluyó a propósito.
 TOLERANCIA_MINUTOS_SUBINTERVALO = 5
+
+# --- Umbrales para marcar un ajuste por anidamiento como "sospechoso" (posible error de
+# datos en vez de una suspensión real). NO bloquean el cálculo del SEC, solo lo señalan
+# para que se revise a mano: una suspensión típica involucra pocas OTs en el medio, no
+# decenas, y no suele durar semanas.
+UMBRAL_SOSPECHOSO_N_OTS_ANIDADAS = 8      # más de N OTs anidadas -> sospechoso
+UMBRAL_SOSPECHOSO_DURACION_DIAS = 5.0     # rango calendario mayor a N días -> sospechoso
+TOLERANCIA_MULTIPLO_24H_MIN = 30          # tolerancia (min) para detectar diferencias ~múltiplo de 24h
 
 # Posibles nombres de columnas dentro de energia.db, para tolerar variantes de esquema.
 ALIAS_COLUMNAS_ENERGIA = {
@@ -572,6 +581,20 @@ def calcular_intervalos_efectivos(inicio_real, fin_real, intervalos_excluir):
     return efectivos
 
 
+def es_multiplo_24h(diferencia_min, tolerancia_min=TOLERANCIA_MULTIPLO_24H_MIN):
+    """
+    True si `diferencia_min` (la diferencia entre ventana calendario y tiempo real de una
+    OT) está muy cerca de ser un múltiplo exacto de 24h (1440 min). Esto es una señal
+    típica de un error de captura de fecha (ej. Inicio o Fin con un día de más/menos),
+    más que de una suspensión real -- una suspensión real casi nunca dura un número
+    "redondo" de días exactos.
+    """
+    if pd.isna(diferencia_min) or diferencia_min <= 0:
+        return False
+    resto = diferencia_min % 1440
+    return resto <= tolerancia_min or resto >= (1440 - tolerancia_min)
+
+
 def buscar_energia_ot_multi(conn, tabla, mapa_col, maquina, intervalos,
                              tolerancia_min=TOLERANCIA_MINUTOS_SUBINTERVALO):
     """
@@ -748,6 +771,18 @@ def agregar_columnas_diagnostico(df):
     # --- Motivo consolidado (texto legible por OT) ---
     def _motivo(row):
         motivos = []
+        if row.get('Anidamiento_Sospechoso', False):
+            dias = row.get('Duracion_Calendario_Min', np.nan) / 1440.0 if pd.notna(row.get('Duracion_Calendario_Min', np.nan)) else np.nan
+            motivos.append(
+                f"🚩 Ajuste por anidamiento sospechoso: se restaron {int(row.get('N_OTs_Anidadas', 0))} OT(s) "
+                f"en un rango calendario de {dias:.1f} días — revisar si es una suspensión real o un error de "
+                f"captura en Inicio/Fin (umbral: >{UMBRAL_SOSPECHOSO_N_OTS_ANIDADAS} OTs o >{UMBRAL_SOSPECHOSO_DURACION_DIAS:.0f} días)"
+            )
+        if row.get('Diferencia_Multiplo_24h', False):
+            motivos.append(
+                "🚩 La diferencia entre ventana calendario y tiempo real es casi un múltiplo exacto de 24h — "
+                "posible error de fecha (Inicio/Fin) en el reporte de Producción, más que una suspensión real"
+            )
         if not row['Ventana_Confiable']:
             dif = row.get('Diferencia_Ventana_Min', np.nan)
             base = (
@@ -1267,6 +1302,18 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
                 energia_desperdiciada_rechazo = (round(energia_total * (prod_rechazo / prod_total), 4)
                                                    if (ventana_confiable and prod_total > 0) else np.nan)
 
+                # --- Banderas de "ajuste sospechoso" (NO bloquean el cálculo, solo avisan) ---
+                duracion_calendario_dias = (
+                    ot['Duracion_Calendario_Min'] / 1440.0 if pd.notna(ot['Duracion_Calendario_Min']) else np.nan
+                )
+                anidamiento_sospechoso = bool(
+                    ajustada_por_anidamiento and (
+                        n_ots_anidadas > UMBRAL_SOSPECHOSO_N_OTS_ANIDADAS or
+                        (pd.notna(duracion_calendario_dias) and duracion_calendario_dias > UMBRAL_SOSPECHOSO_DURACION_DIAS)
+                    )
+                )
+                diferencia_multiplo_24h = es_multiplo_24h(ot.get('Diferencia_Ventana_Min', np.nan))
+
                 fila_resultado = ot.to_dict()
                 fila_resultado.update(metricas)
                 fila_resultado['Ventana_Confiable'] = ventana_confiable
@@ -1276,6 +1323,9 @@ if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
                 fila_resultado['Diferencia_Ventana_Ajustada_Min'] = (
                     round(diferencia_ventana_ajustada, 1) if pd.notna(diferencia_ventana_ajustada) else np.nan
                 )
+                fila_resultado['Anidamiento_Sospechoso'] = anidamiento_sospechoso
+                fila_resultado['Diferencia_Multiplo_24h'] = diferencia_multiplo_24h
+                fila_resultado['Es_Sospechoso'] = anidamiento_sospechoso or diferencia_multiplo_24h
                 fila_resultado['Masa_Buena_Kg'] = round(masa_buena_kg, 3) if pd.notna(masa_buena_kg) else np.nan
                 fila_resultado['Energia_Activa_Estimada_kWh'] = round(energia_activa_kwh, 3) if pd.notna(energia_activa_kwh) else np.nan
                 fila_resultado['Energia_Parada_Estimada_kWh'] = round(energia_parada_kwh, 3) if pd.notna(energia_parada_kwh) else np.nan
@@ -1322,15 +1372,18 @@ if 'df_sec_calculado' in st.session_state:
     n_viables = int(df_board['SEC_Viable'].sum())
     n_no_viables = n_total_ots - n_viables
     n_ajustadas_total = int(df_board['Ajustada_Por_OTs_Anidadas'].sum()) if 'Ajustada_Por_OTs_Anidadas' in df_board.columns else 0
+    n_sospechosos_total = int(df_board['Es_Sospechoso'].sum()) if 'Es_Sospechoso' in df_board.columns else 0
 
     st.markdown(
         f"**{n_viables} de {n_total_ots} OTs** ({(n_viables/n_total_ots*100 if n_total_ots else 0):.0f}%) "
         f"tienen datos de energía viables y ya muestran su SEC calculado. "
         f"De esas, **{n_ajustadas_total}** se rescataron descontando el tiempo de OTs anidadas "
-        f"(posible suspensión)."
+        f"(posible suspensión), y de esas, **{n_sospechosos_total}** quedaron marcadas como 🚩 "
+        f"**sospechosas** (revisar si son suspensiones reales o errores de datos — no se bloquearon, "
+        f"solo se señalan)."
     )
 
-    col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
+    col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns(9)
     with col1:
         maquinas = ['Todas'] + sorted(df_board['ID_Maquina_Normalizado'].dropna().unique().tolist())
         filtro_maq = st.selectbox("🏭 Máquina:", maquinas)
@@ -1353,6 +1406,8 @@ if 'df_sec_calculado' in st.session_state:
         solo_sospechoso = st.checkbox(f"🕵️ Solo SEC sospechoso (>{UMBRAL_PCT_CERO_SOSPECHOSO:.0f}% ceros)", value=False)
     with col8:
         solo_ajustadas = st.checkbox("🩹 Solo OTs rescatadas (anidamiento)", value=False)
+    with col9:
+        solo_sospechosas = st.checkbox("🚩 Solo ajustes sospechosos", value=False)
 
     if filtro_maq != 'Todas':
         df_board = df_board[df_board['ID_Maquina_Normalizado'] == filtro_maq]
@@ -1372,6 +1427,8 @@ if 'df_sec_calculado' in st.session_state:
         df_board = df_board[df_board['SEC_Sospechoso']]
     if solo_ajustadas:
         df_board = df_board[df_board['Ajustada_Por_OTs_Anidadas'] == True]
+    if solo_sospechosas:
+        df_board = df_board[df_board['Es_Sospechoso'] == True]
 
     # Las OTs con SEC viable van primero, para que salten a la vista de inmediato.
     df_board = df_board.sort_values('SEC_Viable', ascending=False)
@@ -1417,9 +1474,11 @@ if 'df_sec_calculado' in st.session_state:
     df_tabla['SEC_Viable'] = df_tabla['SEC_Viable'].map({True: '✅ Sí', False: '🚫 No'})
     df_tabla['SEC_Sospechoso'] = df_tabla['SEC_Sospechoso'].map({True: '🕵️ Sí', False: '—'})
     df_tabla['Ajustada_Por_OTs_Anidadas'] = df_tabla['Ajustada_Por_OTs_Anidadas'].map({True: '🩹 Sí', False: '—'})
+    df_tabla['Es_Sospechoso'] = df_tabla['Es_Sospechoso'].map({True: '🚩 Sí', False: '—'})
 
     st.dataframe(
-        df_tabla[['SEC_Viable', 'SEC_Sospechoso', 'Ajustada_Por_OTs_Anidadas', 'N_OTs_Anidadas', 'OTs_Anidadas_IDs',
+        df_tabla[['SEC_Viable', 'SEC_Sospechoso', 'Ajustada_Por_OTs_Anidadas', 'Es_Sospechoso',
+                   'N_OTs_Anidadas', 'OTs_Anidadas_IDs',
                    'ID_Job', 'ID_Maquina', 'ID_Molde', 'Inicio_Limpio', 'Fin_Limpio',
                    'Total_Masa_Kg', 'Masa_Buena_Kg', 'Energia_Total_kWh', 'Pct_Lecturas_Cero',
                    'SEC_Total_kWh_kg', 'SEC_Inyeccion_kWh_kg', 'SEC_Conforme_kWh_kg',
@@ -1453,6 +1512,116 @@ if 'df_sec_calculado' in st.session_state:
             f"parada) o una falla del medidor — revisa la gráfica de energía de esa OT en el Inspector de Orden "
             f"para diferenciar un caso del otro antes de confiar en ese SEC."
         )
+    if n_sospechosos_total > 0:
+        st.caption(
+            f"🚩 Las **{n_sospechosos_total}** OTs marcadas como **Es_Sospechoso** son ajustes por anidamiento que "
+            f"conviene revisar a mano: involucran más de {UMBRAL_SOSPECHOSO_N_OTS_ANIDADAS} OTs anidadas, un rango "
+            f"calendario mayor a {UMBRAL_SOSPECHOSO_DURACION_DIAS:.0f} días, o una diferencia de ventana casi "
+            f"exactamente múltiplo de 24h. **No se bloqueó su cálculo** (el SEC igual se muestra), pero es más "
+            f"probable que sea un error de captura de fecha que una suspensión real. Usa la Línea de Tiempo por "
+            f"Máquina de abajo para verlas de un vistazo (color rojo)."
+        )
+
+    # ==========================================
+    # 🗓️ LÍNEA DE TIEMPO POR MÁQUINA (GANTT)
+    # ==========================================
+    st.divider()
+    st.markdown("## 🗓️ Línea de Tiempo por Máquina")
+    st.write("Todas las OTs de una máquina en su línea de tiempo real. Las barras que se traslapan horizontalmente "
+             "son la señal visual de una posible suspensión: una OT grande con otra(s) corriendo en el medio.")
+
+    df_prod_gantt = st.session_state.get('df_prod_std')
+    df_sec_gantt = st.session_state.get('df_sec_calculado')
+
+    if df_prod_gantt is None or df_prod_gantt.empty:
+        st.info("Corre el cálculo SEC primero para poder ver la línea de tiempo.")
+    else:
+        maquinas_gantt = sorted(df_prod_gantt['ID_Maquina_Normalizado'].dropna().unique().tolist())
+        gcol1, gcol2 = st.columns([1, 2])
+        with gcol1:
+            maquina_gantt_sel = st.selectbox("🏭 Máquina a visualizar:", maquinas_gantt, key="maquina_gantt_sel")
+
+        df_maq = df_prod_gantt[df_prod_gantt['ID_Maquina_Normalizado'] == maquina_gantt_sel].copy()
+        fecha_min = df_maq['Inicio_Limpio'].min()
+        fecha_max = df_maq['Fin_Limpio'].max()
+
+        with gcol2:
+            rango_fechas = st.date_input(
+                "📅 Rango de fechas a mostrar:",
+                value=(fecha_min.date(), fecha_max.date()),
+                min_value=fecha_min.date(),
+                max_value=fecha_max.date(),
+                key="rango_gantt"
+            )
+
+        if isinstance(rango_fechas, tuple) and len(rango_fechas) == 2:
+            desde = pd.Timestamp(rango_fechas[0])
+            hasta = pd.Timestamp(rango_fechas[1]) + pd.Timedelta(days=1)
+            df_maq = df_maq[(df_maq['Inicio_Limpio'] < hasta) & (df_maq['Fin_Limpio'] >= desde)]
+
+        if df_maq.empty:
+            st.info("No hay OTs de esta máquina en el rango de fechas seleccionado.")
+        else:
+            if len(df_maq) > 300:
+                st.warning(f"⚠️ Hay {len(df_maq)} OTs en este rango — la gráfica puede ser difícil de leer. "
+                           f"Considera acortar el rango de fechas.")
+
+            cols_info = ['ID_Job', 'Confiabilidad', 'Ajustada_Por_OTs_Anidadas', 'Anidamiento_Sospechoso',
+                         'Diferencia_Multiplo_24h', 'SEC_Total_kWh_kg', 'Ventana_Confiable']
+            if df_sec_gantt is not None and not df_sec_gantt.empty:
+                cols_disponibles = [c for c in cols_info if c in df_sec_gantt.columns]
+                df_maq = df_maq.merge(df_sec_gantt[cols_disponibles], on='ID_Job', how='left')
+
+            if 'Confiabilidad' not in df_maq.columns:
+                df_maq['Confiabilidad'] = np.nan
+            df_maq['Confiabilidad'] = df_maq['Confiabilidad'].fillna('Sin masa / sin SEC')
+            for c in ['Ajustada_Por_OTs_Anidadas', 'Anidamiento_Sospechoso', 'Diferencia_Multiplo_24h', 'Ventana_Confiable']:
+                if c not in df_maq.columns:
+                    df_maq[c] = False
+                df_maq[c] = df_maq[c].fillna(False)
+
+            def _categoria_gantt(row):
+                if row.get('Anidamiento_Sospechoso', False) or row.get('Diferencia_Multiplo_24h', False):
+                    return '🚩 Ajuste sospechoso'
+                if row.get('Ajustada_Por_OTs_Anidadas', False):
+                    return '🩹 Ajustada por anidamiento'
+                if not row.get('Ventana_Confiable', False):
+                    return '🚫 Ventana no confiable'
+                if row['Confiabilidad'] == 'Sin masa / sin SEC':
+                    return '⬜ Sin SEC (sin masa u otro dato)'
+                return '✅ SEC calculado normal'
+
+            df_maq['Categoria'] = df_maq.apply(_categoria_gantt, axis=1)
+            color_map = {
+                '✅ SEC calculado normal': '#2ca02c',
+                '🩹 Ajustada por anidamiento': '#1f77b4',
+                '🚩 Ajuste sospechoso': '#d62728',
+                '🚫 Ventana no confiable': '#7f7f7f',
+                '⬜ Sin SEC (sin masa u otro dato)': '#c7c7c7',
+            }
+
+            df_maq_sorted = df_maq.sort_values('Inicio_Limpio').copy()
+            df_maq_sorted['ID_Job_Label'] = df_maq_sorted['ID_Job'].astype(str)
+            hover_cols = [c for c in ['Confiabilidad', 'SEC_Total_kWh_kg'] if c in df_maq_sorted.columns]
+
+            fig_gantt = px.timeline(
+                df_maq_sorted, x_start='Inicio_Limpio', x_end='Fin_Limpio', y='ID_Job_Label',
+                color='Categoria', color_discrete_map=color_map, hover_data=hover_cols
+            )
+            fig_gantt.update_yaxes(
+                categoryorder='array', categoryarray=df_maq_sorted['ID_Job_Label'].tolist()[::-1], title=None
+            )
+            fig_gantt.update_layout(
+                height=max(400, min(24 * len(df_maq_sorted), 1200)),
+                margin=dict(l=10, r=10, t=30, b=10),
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0),
+                xaxis_title=None,
+            )
+            st.plotly_chart(fig_gantt, use_container_width=True)
+            st.caption("Cada barra es una OT. Si ves barras traslapadas horizontalmente, esa máquina corrió más "
+                       "de una OT al mismo tiempo — es la señal visual de una suspensión. 🔵 Azul = ya ajustada "
+                       "automáticamente. 🔴 Rojo = ajuste sospechoso, revisar a mano. ⚫ Gris oscuro = ventana no "
+                       "confiable sin poder ajustar (sin OTs anidadas que restar).")
 
     # ==========================================
     # 🩺 DIAGNÓSTICO DE CONVERGENCIA — muestra acotada de OTs
@@ -1477,6 +1646,7 @@ if 'df_sec_calculado' in st.session_state:
                 "⚠️ Solo con paros que no cuadran",
                 "⚠️ Solo con ventana no confiable",
                 "🩹 Solo rescatadas por OTs anidadas",
+                "🚩 Solo ajustes sospechosos",
                 "🎲 Aleatoria",
                 "📋 Las primeras N (tal como vienen)",
             ]
@@ -1499,6 +1669,8 @@ if 'df_sec_calculado' in st.session_state:
         df_muestra = df_diag[~df_diag['Ventana_Confiable']].head(int(tamano_muestra))
     elif estrategia_muestra == "🩹 Solo rescatadas por OTs anidadas":
         df_muestra = df_diag[df_diag['Ajustada_Por_OTs_Anidadas']].head(int(tamano_muestra))
+    elif estrategia_muestra == "🚩 Solo ajustes sospechosos":
+        df_muestra = df_diag[df_diag['Es_Sospechoso']].head(int(tamano_muestra))
     elif estrategia_muestra == "🎲 Aleatoria":
         df_muestra = df_diag.sample(n=min(int(tamano_muestra), len(df_diag)), random_state=None) if len(df_diag) > 0 else df_diag
     else:  # primeras N tal como vienen
