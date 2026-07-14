@@ -1163,6 +1163,63 @@ st.session_state['clave_cache_energia'] = clave_cache_energia
 st.session_state['tabla_energia_usada'] = tabla_usada
 st.session_state['mapa_col_energia'] = mapa_col_energia
 
+
+# ==========================================
+# 1.5 COBERTURA Y SEGMENTACIÓN TEMPORAL
+# ==========================================
+st.markdown("### 1.5 Cobertura y Segmentación Temporal")
+
+with st.spinner("Analizando rangos de fechas disponibles..."):
+    # 1. Obtener fechas de Producción
+    fechas_prod_temp = pd.to_datetime(df_prod_raw['Tiempo Empezar'], errors='coerce', format='mixed', dayfirst=True)
+    min_prod = fechas_prod_temp.min()
+    max_prod = fechas_prod_temp.max()
+
+    # 2. Obtener fechas de Energía (con consulta SQL para no cargar la tabla)
+    try:
+        col_ts_nrg = mapa_col_energia['Timestamp']
+        query_fechas = f'SELECT MIN("{col_ts_nrg}") as min_ts, MAX("{col_ts_nrg}") as max_ts FROM "{tabla_usada}"'
+        df_fechas_nrg = pd.read_sql(query_fechas, conn_energia)
+        min_nrg = pd.to_datetime(df_fechas_nrg['min_ts'].iloc[0])
+        max_nrg = pd.to_datetime(df_fechas_nrg['max_ts'].iloc[0])
+    except Exception:
+        min_nrg, max_nrg = pd.NaT, pd.NaT
+
+# Mostrar el Dashboard de Cobertura
+col_f1, col_f2 = st.columns(2)
+str_min_prod = min_prod.strftime('%Y-%m-%d') if pd.notna(min_prod) else 'N/D'
+str_max_prod = max_prod.strftime('%Y-%m-%d') if pd.notna(max_prod) else 'N/D'
+str_min_nrg = min_nrg.strftime('%Y-%m-%d') if pd.notna(min_nrg) else 'N/D'
+str_max_nrg = max_nrg.strftime('%Y-%m-%d') if pd.notna(max_nrg) else 'N/D'
+
+col_f1.metric("📅 Rango en Producción", f"{str_min_prod} ➔ {str_max_prod}")
+col_f2.metric("⚡ Rango en Energia.db", f"{str_min_nrg} ➔ {str_max_nrg}")
+
+st.write("Selecciona el periodo que deseas procesar en esta ejecución para no sobrecargar el sistema:")
+
+# Selector de fechas
+fecha_inicio_default = min_prod.date() if pd.notna(min_prod) else dt.date.today()
+fecha_fin_default = max_prod.date() if pd.notna(max_prod) else dt.date.today()
+
+rango_procesamiento = st.date_input(
+    "Segmentar análisis (Desde - Hasta):",
+    value=(fecha_inicio_default, fecha_fin_default),
+    key="filtro_segmentacion"
+)
+
+# Aplicar el filtro a Producción ANTES del cruce
+if isinstance(rango_procesamiento, tuple) and len(rango_procesamiento) == 2:
+    fecha_ini_filtro = pd.to_datetime(rango_procesamiento[0])
+    fecha_fin_filtro = pd.to_datetime(rango_procesamiento[1]) + pd.Timedelta(days=1) # Para incluir el último día completo
+    
+    # Conservamos las OTs que caen en el rango, y las que no tienen fecha las dejamos pasar 
+    # para que el validador del motor SEC las descarte formalmente después y te avise.
+    mascara_rango = (fechas_prod_temp >= fecha_ini_filtro) & (fechas_prod_temp < fecha_fin_filtro)
+    df_prod_raw = df_prod_raw[mascara_rango | fechas_prod_temp.isna()].copy()
+    
+    st.info(f"📊 El motor procesará **{len(df_prod_raw)}** OTs correspondientes al periodo seleccionado.")
+
+
 if st.button("🚀 Iniciar Cruce y Cálculo SEC", type="primary"):
     with st.status("Procesando Motor SEC...", expanded=True) as status:
         try:
