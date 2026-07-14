@@ -13,6 +13,7 @@ import plotly.express as px
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+import math
 
 # 1. Configuración de la página
 st.set_page_config(page_title="Analítica SEC", page_icon="⚡", layout="wide")
@@ -864,20 +865,43 @@ COLUMNAS_ANALISIS_SEC = [
 def _preparar_df_para_sheets(df):
     """
     Deja el DataFrame listo para subir con gspread: fechas como texto ISO, NaN/inf como
-    None (celda vacía), y todo lo demás como tipos nativos de Python (gspread no acepta
-    tipos numpy directamente en algunas versiones).
+    string vacío (celda en blanco), y todo lo demás como tipos nativos de Python.
     """
     df = df.copy()
+    
+    # 1. Convertir fechas a texto
     for c in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[c]):
             df[c] = df[c].dt.strftime('%Y-%m-%d %H:%M:%S')
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.astype(object).where(pd.notna(df), None)
-    # Convierte bool/numpy numérico a tipos nativos de Python.
+            
+    # 2. Función de limpieza estricta celda por celda
+    def limpiar_valor(v):
+        # Si es un nulo reconocido por Pandas (NaT, None, pd.NA, np.nan)
+        if pd.isna(v):
+            return ""
+            
+        # Si es un número de tipo flotante (de Numpy o Python estándar)
+        if isinstance(v, (float, np.floating)):
+            # math.isnan captura el float('nan') que suele romper el JSON
+            if math.isnan(v) or math.isinf(v):
+                return ""
+            return float(v)
+            
+        # Si es un entero
+        if isinstance(v, (int, np.integer)):
+            return int(v)
+            
+        # Si es booleano
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+            
+        # Cualquier otro tipo (texto, etc.)
+        return v
+
+    # 3. Aplicar el mapeo a todas las columnas
     for c in df.columns:
-        df[c] = df[c].map(lambda v: bool(v) if isinstance(v, (np.bool_,)) else v)
-        df[c] = df[c].map(lambda v: float(v) if isinstance(v, (np.floating,)) else v)
-        df[c] = df[c].map(lambda v: int(v) if isinstance(v, (np.integer,)) else v)
+        df[c] = df[c].map(limpiar_valor)
+        
     return df
 
 
