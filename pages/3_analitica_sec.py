@@ -1175,7 +1175,21 @@ with st.spinner("Analizando rangos de fechas disponibles en las fuentes y export
     min_prod = fechas_prod_temp.min()
     max_prod = fechas_prod_temp.max()
 
-    # 2. Obtener fechas de Energía (con consulta SQL para no cargar la tabla)
+    # 2. Obtener fechas de Materiales (Masas) cruzando con Producción
+    # Estandarizamos temporalmente los IDs para asegurar un cruce preciso
+    df_prod_ids = df_prod_raw[['Trabajo / Orden', 'Tiempo Empezar']].copy()
+    df_prod_ids['ID_Job_std'] = df_prod_ids['Trabajo / Orden'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    df_prod_ids['Fecha'] = pd.to_datetime(df_prod_ids['Tiempo Empezar'], errors='coerce', format='mixed', dayfirst=True)
+    
+    df_masas_ids = df_masas_raw[['ID_Job']].copy()
+    df_masas_ids['ID_Job_std'] = df_masas_ids['ID_Job'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    
+    # Cruzamos para heredar la fecha de la OT a cada registro de material
+    df_masas_fechas = pd.merge(df_masas_ids, df_prod_ids[['ID_Job_std', 'Fecha']], on='ID_Job_std', how='inner')
+    min_mat = df_masas_fechas['Fecha'].min()
+    max_mat = df_masas_fechas['Fecha'].max()
+
+    # 3. Obtener fechas de Energía (con consulta SQL para no cargar la tabla completa)
     try:
         col_ts_nrg = mapa_col_energia['Timestamp']
         query_fechas = f'SELECT MIN("{col_ts_nrg}") as min_ts, MAX("{col_ts_nrg}") as max_ts FROM "{tabla_usada}"'
@@ -1185,13 +1199,13 @@ with st.spinner("Analizando rangos de fechas disponibles en las fuentes y export
     except Exception:
         min_nrg, max_nrg = pd.NaT, pd.NaT
 
-    # 3. Obtener el estado actual de la exportación en BI (Analisis_SEC)
+    # 4. Obtener el estado actual de la exportación en BI (Analisis_SEC)
     try:
         gc_cobertura = conectar_sheets()
         sh_cobertura = gc_cobertura.open_by_url(SHEET_URL)
         ws_analisis = sh_cobertura.worksheet(NOMBRE_HOJA_ANALISIS)
         
-        # Descargamos los registros de la hoja exportada para ver qué contiene
+        # Descargamos los registros para leer las fechas de la última exportación
         df_exportado = pd.DataFrame(ws_analisis.get_all_records())
         
         if not df_exportado.empty and 'Inicio_Limpio' in df_exportado.columns:
@@ -1210,16 +1224,22 @@ with st.spinner("Analizando rangos de fechas disponibles en las fuentes y export
     except Exception as e:
         info_exportacion = "Error de lectura"
 
-# Mostrar el Dashboard de Cobertura
-col_f1, col_f2, col_f3 = st.columns(3)
+# Mostrar el Dashboard de Cobertura en 4 columnas
+col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+
 str_min_prod = min_prod.strftime('%Y-%m-%d') if pd.notna(min_prod) else 'N/D'
 str_max_prod = max_prod.strftime('%Y-%m-%d') if pd.notna(max_prod) else 'N/D'
+
+str_min_mat = min_mat.strftime('%Y-%m-%d') if pd.notna(min_mat) else 'N/D'
+str_max_mat = max_mat.strftime('%Y-%m-%d') if pd.notna(max_mat) else 'N/D'
+
 str_min_nrg = min_nrg.strftime('%Y-%m-%d') if pd.notna(min_nrg) else 'N/D'
 str_max_nrg = max_nrg.strftime('%Y-%m-%d') if pd.notna(max_nrg) else 'N/D'
 
-col_f1.metric("📅 Rango en Producción", f"{str_min_prod} ➔ {str_max_prod}")
-col_f2.metric("⚡ Rango en Energia.db", f"{str_min_nrg} ➔ {str_max_nrg}")
-col_f3.metric("📤 Exportado a BI (Analisis_SEC)", info_exportacion)
+col_f1.metric("📅 Producción", f"{str_min_prod} ➔ {str_max_prod}")
+col_f2.metric("⚖️ Materiales", f"{str_min_mat} ➔ {str_max_mat}")
+col_f3.metric("⚡ Energía", f"{str_min_nrg} ➔ {str_max_nrg}")
+col_f4.metric("📤 Exportado (BI)", info_exportacion)
 
 st.write("Selecciona el periodo que deseas procesar en esta ejecución para no sobrecargar la integración de datos:")
 
@@ -1233,12 +1253,12 @@ rango_procesamiento = st.date_input(
     key="filtro_segmentacion"
 )
 
-# Aplicar el filtro a Producción ANTES del cruce
+# Aplicar el filtro a Producción ANTES del cruce principal
 if isinstance(rango_procesamiento, tuple) and len(rango_procesamiento) == 2:
     fecha_ini_filtro = pd.to_datetime(rango_procesamiento[0])
     fecha_fin_filtro = pd.to_datetime(rango_procesamiento[1]) + pd.Timedelta(days=1) # Para incluir el último día completo
     
-    # Conservamos las OTs que caen en el rango
+    # Conservamos las OTs que caen en el rango y las que no tienen fecha (para que el validador SEC las diagnostique)
     mascara_rango = (fechas_prod_temp >= fecha_ini_filtro) & (fechas_prod_temp < fecha_fin_filtro)
     df_prod_raw = df_prod_raw[mascara_rango | fechas_prod_temp.isna()].copy()
     
