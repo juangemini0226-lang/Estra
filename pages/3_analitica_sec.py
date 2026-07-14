@@ -1169,7 +1169,7 @@ st.session_state['mapa_col_energia'] = mapa_col_energia
 # ==========================================
 st.markdown("### 1.5 Cobertura y Segmentación Temporal")
 
-with st.spinner("Analizando rangos de fechas disponibles..."):
+with st.spinner("Analizando rangos de fechas disponibles en las fuentes y exportaciones previas..."):
     # 1. Obtener fechas de Producción
     fechas_prod_temp = pd.to_datetime(df_prod_raw['Tiempo Empezar'], errors='coerce', format='mixed', dayfirst=True)
     min_prod = fechas_prod_temp.min()
@@ -1185,8 +1185,33 @@ with st.spinner("Analizando rangos de fechas disponibles..."):
     except Exception:
         min_nrg, max_nrg = pd.NaT, pd.NaT
 
+    # 3. Obtener el estado actual de la exportación en BI (Analisis_SEC)
+    try:
+        gc_cobertura = conectar_sheets()
+        sh_cobertura = gc_cobertura.open_by_url(SHEET_URL)
+        ws_analisis = sh_cobertura.worksheet(NOMBRE_HOJA_ANALISIS)
+        
+        # Descargamos los registros de la hoja exportada para ver qué contiene
+        df_exportado = pd.DataFrame(ws_analisis.get_all_records())
+        
+        if not df_exportado.empty and 'Inicio_Limpio' in df_exportado.columns:
+            fechas_exp = pd.to_datetime(df_exportado['Inicio_Limpio'], errors='coerce')
+            min_exp = fechas_exp.min()
+            max_exp = fechas_exp.max()
+            n_filas_exp = len(df_exportado)
+            
+            str_min_exp = min_exp.strftime('%Y-%m-%d') if pd.notna(min_exp) else 'N/D'
+            str_max_exp = max_exp.strftime('%Y-%m-%d') if pd.notna(max_exp) else 'N/D'
+            info_exportacion = f"{str_min_exp} ➔ {str_max_exp}\n({n_filas_exp} OTs)"
+        else:
+            info_exportacion = "Hoja vacía o sin formato"
+    except gspread.exceptions.WorksheetNotFound:
+        info_exportacion = "Aún no existe (Nunca exportada)"
+    except Exception as e:
+        info_exportacion = "Error de lectura"
+
 # Mostrar el Dashboard de Cobertura
-col_f1, col_f2 = st.columns(2)
+col_f1, col_f2, col_f3 = st.columns(3)
 str_min_prod = min_prod.strftime('%Y-%m-%d') if pd.notna(min_prod) else 'N/D'
 str_max_prod = max_prod.strftime('%Y-%m-%d') if pd.notna(max_prod) else 'N/D'
 str_min_nrg = min_nrg.strftime('%Y-%m-%d') if pd.notna(min_nrg) else 'N/D'
@@ -1194,8 +1219,9 @@ str_max_nrg = max_nrg.strftime('%Y-%m-%d') if pd.notna(max_nrg) else 'N/D'
 
 col_f1.metric("📅 Rango en Producción", f"{str_min_prod} ➔ {str_max_prod}")
 col_f2.metric("⚡ Rango en Energia.db", f"{str_min_nrg} ➔ {str_max_nrg}")
+col_f3.metric("📤 Exportado a BI (Analisis_SEC)", info_exportacion)
 
-st.write("Selecciona el periodo que deseas procesar en esta ejecución para no sobrecargar el sistema:")
+st.write("Selecciona el periodo que deseas procesar en esta ejecución para no sobrecargar la integración de datos:")
 
 # Selector de fechas
 fecha_inicio_default = min_prod.date() if pd.notna(min_prod) else dt.date.today()
@@ -1212,8 +1238,7 @@ if isinstance(rango_procesamiento, tuple) and len(rango_procesamiento) == 2:
     fecha_ini_filtro = pd.to_datetime(rango_procesamiento[0])
     fecha_fin_filtro = pd.to_datetime(rango_procesamiento[1]) + pd.Timedelta(days=1) # Para incluir el último día completo
     
-    # Conservamos las OTs que caen en el rango, y las que no tienen fecha las dejamos pasar 
-    # para que el validador del motor SEC las descarte formalmente después y te avise.
+    # Conservamos las OTs que caen en el rango
     mascara_rango = (fechas_prod_temp >= fecha_ini_filtro) & (fechas_prod_temp < fecha_fin_filtro)
     df_prod_raw = df_prod_raw[mascara_rango | fechas_prod_temp.isna()].copy()
     
