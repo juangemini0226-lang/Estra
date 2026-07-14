@@ -839,27 +839,68 @@ def agregar_columnas_diagnostico(df):
 # ==========================================
 NOMBRE_HOJA_ANALISIS = "Analisis_SEC"
 
-# Columnas más representativas del resultado, pensadas para consumo en un BI (Power BI,
-# Looker Studio, Sheets con tablas dinámicas, etc.) o análisis directo en Sheets. Se
-# mantiene un set curado (no TODAS las ~80 columnas internas) para que la hoja sea liviana
-# y fácil de modelar. Si una columna no existe en el resultado (por ejemplo porque no se
-# detectó columna de Molde), simplemente se omite sin romper la exportación.
+# Set de columnas exportado a la pestaña de BI. Se dejó AMPLIADO a propósito (a diferencia
+# de un dashboard ejecutivo, que solo necesitaría un puñado de KPIs) porque el destino es
+# un modelo de datos propio en Power BI / Looker Studio: ahí conviene tener granularidad
+# completa (identificadores, tiempos crudos, energía, masa, costos, paros, defectos y toda
+# la trazabilidad de ajustes/diagnóstico) para que las medidas y relaciones se construyan
+# del lado del BI, en vez de venir ya "pre-masticadas" desde acá.
 COLUMNAS_ANALISIS_SEC = [
+    # --- Identificación de la OT ---
     'ID_Job', 'ID_Maquina', 'ID_Maquina_Normalizado', 'ID_Molde', 'ID_Molde_Descripcion', 'ID_Parte',
+
+    # --- Tiempos ---
     'Inicio_Limpio', 'Fin_Limpio',
     'Duracion_Calendario_Min', 'Duracion_Real_Min', 'Activo_Min', 'Inactivo_Min',
+    'Diferencia_Ventana_Min', 'Diferencia_Ventana_Ajustada_Min',
+
+    # --- Masa ---
     'Total_Masa_Kg', 'Masa_Buena_Kg',
+
+    # --- Producción ---
     'Producción Total', 'Producción Buena', 'Producción de Rechazo',
+
+    # --- Energía ---
     'Energia_Total_kWh', 'Energia_Activa_Estimada_kWh', 'Energia_Parada_Estimada_kWh', 'Energia_Parada_Pct',
+    'N_Lecturas_Energia', 'Max_Gap_Min',
+
+    # --- SEC (resultado principal, 3 variantes) ---
     'SEC_Total_kWh_kg', 'SEC_Inyeccion_kWh_kg', 'SEC_Conforme_kWh_kg',
+
+    # --- Costos / No conformidad ---
     'Costo_Unitario_Estandar', 'Costo_No_Conformidad', 'Energia_Desperdiciada_Rechazo_kWh',
+
+    # --- Paros (detalle "SEC paro" / tiempo detenido) ---
+    'Suma_Paros_Min', 'Diferencia_Paros_vs_Inactivo', 'Paros_Cuadran',
+
+    # --- Defectos ---
+    'Suma_Defectos', 'Diferencia_Defectos_vs_Rechazo', 'Defectos_Cuadran',
+
+    # --- Calidad del dato / confiabilidad ---
     'Cobertura_Pct', 'Continuidad_Pct', 'Pct_Lecturas_Cero', 'Confiabilidad', 'Score_Confiabilidad',
     'SEC_Viable', 'SEC_Sospechoso',
+
+    # --- Trazabilidad de ajustes por OTs anidadas / suspensiones ---
     'Ventana_Confiable', 'Ajustada_Por_OTs_Anidadas', 'N_OTs_Anidadas', 'OTs_Anidadas_IDs',
     'Anidamiento_Sospechoso', 'Diferencia_Multiplo_24h', 'Es_Sospechoso',
-    'Solape_Ventana_Energia', 'Produccion_Cuadra', 'Defectos_Cuadran', 'Paros_Cuadran',
+
+    # --- Validaciones cruzadas ---
+    'Solape_Ventana_Energia', 'Produccion_Cuadra',
+
+    # --- Diagnóstico consolidado ---
     'N_Problemas_Detectados', 'Diagnostico',
 ]
+
+# Renombre aplicado SOLO al exportar a la hoja de BI: quita espacios y tildes de las
+# columnas que originalmente vienen así desde la hoja de Producción, para que Power BI /
+# Looker Studio puedan referenciarlas directamente en DAX/fórmulas sin corchetes ni
+# problemas de encoding. El resto de la app (tablero, Gantt, Inspector de Orden, etc.)
+# sigue usando los nombres originales sin ningún cambio — este mapeo NO se aplica ahí.
+RENOMBRE_COLUMNAS_ANALISIS_SEC = {
+    'Producción Total': 'Produccion_Total_Uds',
+    'Producción Buena': 'Produccion_Buena_Uds',
+    'Producción de Rechazo': 'Produccion_Rechazo_Uds',
+}
 
 
 def _preparar_df_para_sheets(df):
@@ -911,6 +952,12 @@ def exportar_a_analisis_sec(df_resultado, sheet_url=SHEET_URL, nombre_hoja=NOMBR
     pestaña dedicada del mismo Google Sheet (se crea si no existe; si ya existe, se limpia
     y se reemplaza por completo con el resultado más reciente — así siempre queda 1
     fuente de verdad actualizada, en vez de ir acumulando exportaciones duplicadas).
+
+    Las columnas se seleccionan según COLUMNAS_ANALISIS_SEC (si una no existe en el
+    resultado, se omite sin romper la exportación) y se renombran según
+    RENOMBRE_COLUMNAS_ANALISIS_SEC antes de escribirse, para que los encabezados que
+    lleguen a Power BI / Looker Studio no tengan espacios ni tildes.
+
     Devuelve (n_filas, n_columnas, url_hoja).
     """
     gc = conectar_sheets()
@@ -918,9 +965,11 @@ def exportar_a_analisis_sec(df_resultado, sheet_url=SHEET_URL, nombre_hoja=NOMBR
 
     cols_presentes = [c for c in COLUMNAS_ANALISIS_SEC if c in df_resultado.columns]
     df_export = df_resultado[cols_presentes].copy()
+    df_export = df_export.rename(columns=RENOMBRE_COLUMNAS_ANALISIS_SEC)
     df_export = _preparar_df_para_sheets(df_export)
 
-    n_filas, n_cols = len(df_export), len(cols_presentes)
+    encabezados_export = [RENOMBRE_COLUMNAS_ANALISIS_SEC.get(c, c) for c in cols_presentes]
+    n_filas, n_cols = len(df_export), len(encabezados_export)
 
     try:
         ws = sh.worksheet(nombre_hoja)
@@ -933,7 +982,7 @@ def exportar_a_analisis_sec(df_resultado, sheet_url=SHEET_URL, nombre_hoja=NOMBR
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=nombre_hoja, rows=str(n_filas + 10), cols=str(n_cols + 2))
 
-    valores = [cols_presentes] + df_export.values.tolist()
+    valores = [encabezados_export] + df_export.values.tolist()
     ws.update(values=valores, range_name='A1', value_input_option='USER_ENTERED')
 
     url_hoja = f"{sheet_url.split('/edit')[0]}/edit#gid={ws.id}"
