@@ -839,6 +839,15 @@ def agregar_columnas_diagnostico(df):
 # ==========================================
 NOMBRE_HOJA_ANALISIS = "Analisis_SEC"
 
+# Locale que se fuerza en el spreadsheet ANTES de escribir la pestaña de BI, para que los
+# números queden sin ambigüedad de separador decimal/miles (punto = decimal, coma = miles),
+# sin importar el locale original del documento (ej. es_CO). Esto es lo que evita el
+# problema de "2,13" mostrándose en vez de "213": si el spreadsheet está en locale
+# latino y se le escribe el entero 213, Sheets puede renderizarlo de forma ambigua para
+# cualquier herramienta externa que lo lea con reglas US. Forzando en_US una sola vez,
+# el valor se escribe y se lee siempre de la misma forma.
+LOCALE_EXPORTACION_BI = "en_US"
+
 # Set de columnas exportado a la pestaña de BI. Se dejó AMPLIADO a propósito (a diferencia
 # de un dashboard ejecutivo, que solo necesitaría un puñado de KPIs) porque el destino es
 # un modelo de datos propio en Power BI / Looker Studio: ahí conviene tener granularidad
@@ -903,6 +912,42 @@ RENOMBRE_COLUMNAS_ANALISIS_SEC = {
 }
 
 
+def _forzar_locale_spreadsheet(sh, locale_deseado=LOCALE_EXPORTACION_BI):
+    """
+    Fuerza el locale del spreadsheet COMPLETO al valor deseado (por defecto en_US: punto
+    = decimal, coma = miles) si actualmente es distinto. Se hace ANTES de escribir la
+    pestaña de BI, para que los números que escribamos como float/int nativos de Python
+    queden guardados y RENDERIZADOS de forma inequívoca — sin importar el locale
+    regional (ej. es_CO) que tuviera el documento originalmente.
+
+    Por qué es seguro hacerlo aquí: el flujo de esta app siempre BORRA por completo la
+    pestaña 'Analisis_SEC' y la reescribe de cero en cada exportación (ver
+    exportar_a_analisis_sec), así que no hay datos "viejos" en otro formato que dependan
+    del locale anterior. Nota: esto cambia el locale de TODO el archivo de Sheets, no
+    solo de esta pestaña — si el mismo archivo tiene otras hojas donde el formato visual
+    de fechas/números en locale latino importa para un humano, revísalas después de
+    exportar (el valor interno de esas celdas no cambia, solo cómo se referencian
+    fórmulas de locale-específico, si las hubiera).
+
+    Se verifica sh.locale ANTES de llamar a la API para no gastar cuota en llamadas
+    innecesarias cuando el locale ya es el correcto.
+    """
+    try:
+        locale_actual = sh.locale
+    except Exception:
+        locale_actual = None
+
+    if locale_actual != locale_deseado:
+        sh.batch_update({
+            "requests": [{
+                "updateSpreadsheetProperties": {
+                    "properties": {"locale": locale_deseado},
+                    "fields": "locale"
+                }
+            }]
+        })
+
+
 def _preparar_df_para_sheets(df):
     """
     Deja el DataFrame listo para subir con gspread: fechas como texto ISO, NaN/inf como
@@ -953,6 +998,11 @@ def exportar_a_analisis_sec(df_resultado, sheet_url=SHEET_URL, nombre_hoja=NOMBR
     y se reemplaza por completo con el resultado más reciente — así siempre queda 1
     fuente de verdad actualizada, en vez de ir acumulando exportaciones duplicadas).
 
+    Antes de escribir, se fuerza el locale del spreadsheet a en_US (ver
+    _forzar_locale_spreadsheet) para que los números no queden sujetos a la ambigüedad
+    coma/punto del locale regional del documento — esto es lo que resuelve el problema
+    de valores como '213' mostrándose como '2,13'.
+
     Las columnas se seleccionan según COLUMNAS_ANALISIS_SEC (si una no existe en el
     resultado, se omite sin romper la exportación) y se renombran según
     RENOMBRE_COLUMNAS_ANALISIS_SEC antes de escribirse, para que los encabezados que
@@ -962,6 +1012,8 @@ def exportar_a_analisis_sec(df_resultado, sheet_url=SHEET_URL, nombre_hoja=NOMBR
     """
     gc = conectar_sheets()
     sh = gc.open_by_url(sheet_url)
+
+    _forzar_locale_spreadsheet(sh)
 
     cols_presentes = [c for c in COLUMNAS_ANALISIS_SEC if c in df_resultado.columns]
     df_export = df_resultado[cols_presentes].copy()
