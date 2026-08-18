@@ -183,7 +183,11 @@ if uploaded_file is not None:
                     st.write(f"📝 Actualizando pestaña '{NOMBRE_HOJA_DESTINO}'...")
                     try:
                         worksheet = sh.worksheet(NOMBRE_HOJA_DESTINO)
-                        df_existente = get_as_dataframe(worksheet).dropna(how='all').dropna(axis=1, how='all')
+                        # dtype=str es crítico: sin esto, columnas como 'Trabajo / Orden'
+                        # (todo dígitos) se leen como int64/float64, pierden ceros a la
+                        # izquierda y dejan de coincidir con el string del CSV nuevo →
+                        # en vez de actualizar la fila, la duplica.
+                        df_existente = get_as_dataframe(worksheet, dtype=str).dropna(how='all').dropna(axis=1, how='all')
                     except gspread.WorksheetNotFound:
                         worksheet = sh.add_worksheet(
                             title=NOMBRE_HOJA_DESTINO, rows="2000", cols=str(len(df_final.columns))
