@@ -7,8 +7,8 @@ st.write("Bienvenido al sistema integrado. Selecciona un módulo para comenzar a
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# Diseño de 4 columnas (Cambio aquí para acomodar la nueva tarjeta)
-col1, col2, col3, col4 = st.columns(4)
+# Diseño de 5 columnas (Cambio aquí para acomodar la nueva tarjeta)
+col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
     with st.container(border=True):
@@ -37,5 +37,12 @@ with col4:
         st.write("Cruce de energía y tiempo de máquina.")
         if st.button("Abrir Analítica", use_container_width=True, type="primary"):
             st.switch_page("pages/3_analitica_sec.py")
+
+with col5:
+    with st.container(border=True):
+        st.markdown("### 🛑 Improductivos")
+        st.write("Extracción de causas de paro por OT/máquina.")
+        if st.button("Abrir Improductivos", use_container_width=True, type="primary"):
+            st.switch_page("pages/5_improductivos.py")
 
 st.divider()
