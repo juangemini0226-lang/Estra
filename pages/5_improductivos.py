@@ -14,12 +14,15 @@ st.set_page_config(page_title="Improductivos | Extractor", page_icon="🛑", lay
 st.title("🛑 Extractor de Tiempos Improductivos")
 st.write(
     "Sube el CSV del **Informe de Tiempo de Inactividad de Trabajo** (reporte de paros por OT/máquina) "
-    "para extraer las causas de paro y cargarlas a la pestaña **Improductivos** del tablero maestro."
+    "para extraer las causas de paro y cargarlas a la pestaña **Improductivos** del tablero maestro. "
+    "El sistema cruza automáticamente cada OT contra **produccion SEC** para traer el **Molde** y la "
+    "**Fecha de Inicio de Producción** (distinta a la fecha en que subes este CSV)."
 )
 
 # Misma hoja de cálculo que usan los demás módulos del tablero
 SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1lRg2Fc1pk3HBfXkYwXhWnFlTAGxx9gvoZ4hRnJ1AhXY/edit#gid=0'
 NOMBRE_HOJA_DESTINO = "Improductivos"
+NOMBRE_HOJA_PRODUCCION = "produccion SEC"
 
 # Etiqueta ancla: todas las filas del reporte traen este literal justo antes
 # del bloque de datos reales (Departamento, Máquina, Trabajo, Parte, tiempos y causas).
@@ -32,6 +35,38 @@ def conectar_sheets():
     creds_dict = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     return gspread.authorize(creds)
+
+
+@st.cache_data(ttl=120, show_spinner="🔎 Buscando Molde y Fecha de Inicio en 'produccion SEC'...")
+def obtener_lookup_produccion():
+    """
+    Trae la pestaña 'produccion SEC' (ya depurada, 1 fila por OT gracias al
+    drop_duplicates que hace el extractor de producción) y arma un diccionario:
+        { "Trabajo / Orden": {"Molde": ..., "Tiempo Empezar": ...}, ... }
+
+    Se cachea 2 min para no golpear la API de Google Sheets en cada rerun de
+    Streamlit (abrir un expander, tocar el dataframe, etc. también son reruns).
+    """
+    gc = conectar_sheets()
+    sh = gc.open_by_url(SPREADSHEET_URL)
+    try:
+        ws_prod = sh.worksheet(NOMBRE_HOJA_PRODUCCION)
+    except gspread.WorksheetNotFound:
+        return {}
+
+    df_prod = get_as_dataframe(ws_prod, dtype=str).dropna(how='all').dropna(axis=1, how='all')
+    if df_prod.empty or "Trabajo / Orden" not in df_prod.columns:
+        return {}
+
+    df_prod["Trabajo / Orden"] = df_prod["Trabajo / Orden"].astype(str).str.strip()
+    # Por si quedara algún residuo, nos quedamos con la última ocurrencia por OT.
+    df_prod = df_prod.drop_duplicates(subset="Trabajo / Orden", keep="last")
+
+    columnas_util = [c for c in ["Molde", "Tiempo Empezar"] if c in df_prod.columns]
+    if not columnas_util:
+        return {}
+
+    return df_prod.set_index("Trabajo / Orden")[columnas_util].to_dict(orient="index")
 
 
 def hhmm_a_minutos(valor):
@@ -135,7 +170,8 @@ if uploaded_file is not None:
         else:
             filas_ignoradas += 1
 
-    columnas_orden = [
+    # Columnas que salen directo del CSV de improductivos (sin Molde/Fecha aún)
+    columnas_base = [
         "Fecha Reporte", "Departamento", "Máquina", "Trabajo / Orden", "Número de Parte",
         "Tiempo de Actividad", "Tiempo de Actividad (min)",
         "Tiempo de Inactividad", "Tiempo de Inactividad (min)", "% de Inactividad",
@@ -149,7 +185,29 @@ if uploaded_file is not None:
             f"'{ETIQUETA_ANCLA}' en cada fila)."
         )
     else:
-        df_final = pd.DataFrame(registros)[columnas_orden]
+        df_final = pd.DataFrame(registros)[columnas_base]
+        df_final["Trabajo / Orden"] = df_final["Trabajo / Orden"].astype(str).str.strip()
+
+        # --- Cruce con producción: trae Molde y Fecha Inicio Producción por OT ---
+        lookup_produccion = obtener_lookup_produccion()
+
+        df_final["Molde"] = df_final["Trabajo / Orden"].apply(
+            lambda ot: lookup_produccion.get(ot, {}).get("Molde")
+        )
+        df_final["Fecha Inicio Producción"] = df_final["Trabajo / Orden"].apply(
+            lambda ot: lookup_produccion.get(ot, {}).get("Tiempo Empezar")
+        )
+
+        # Orden final de columnas, ya con Molde y Fecha Inicio Producción insertadas
+        # justo después de los datos de identificación de la OT.
+        columnas_orden = [
+            "Fecha Reporte", "Departamento", "Máquina", "Trabajo / Orden", "Número de Parte",
+            "Molde", "Fecha Inicio Producción",
+            "Tiempo de Actividad", "Tiempo de Actividad (min)",
+            "Tiempo de Inactividad", "Tiempo de Inactividad (min)", "% de Inactividad",
+            "Orden Causa", "Código Causa", "Cuenta Paros", "Tiempo Causa", "Tiempo Causa (min)",
+        ]
+        df_final = df_final[columnas_orden]
 
         st.success(
             f"¡Extracción completada! Se procesaron {df_final['Trabajo / Orden'].nunique()} "
@@ -157,6 +215,20 @@ if uploaded_file is not None:
         )
         if filas_ignoradas:
             st.caption(f"⚠️ {filas_ignoradas} fila(s) no coincidían con el formato esperado y fueron omitidas.")
+
+        if not lookup_produccion:
+            st.warning(
+                f"⚠️ No se encontró la pestaña '{NOMBRE_HOJA_PRODUCCION}' en el tablero (o está vacía/sin las "
+                "columnas 'Trabajo / Orden', 'Molde', 'Tiempo Empezar'). Molde y Fecha Inicio Producción "
+                "quedaron vacíos para todas las filas."
+            )
+        else:
+            ot_sin_match = df_final.loc[df_final["Molde"].isna(), "Trabajo / Orden"].nunique()
+            if ot_sin_match:
+                st.caption(
+                    f"⚠️ {ot_sin_match} OT no se encontraron en '{NOMBRE_HOJA_PRODUCCION}' "
+                    "(probablemente aún no se ha cargado su producción). Molde/Fecha de Inicio quedaron vacíos."
+                )
 
         with st.expander("👀 Ver vista previa de los datos extraídos"):
             st.dataframe(df_final)
@@ -202,7 +274,13 @@ if uploaded_file is not None:
                         df_combinado = pd.concat([df_existente, df_final], ignore_index=True)
                         df_combinado.drop_duplicates(subset=llave_primaria, keep='last', inplace=True)
 
+                    # reindex por si df_existente traía columnas antiguas sin Molde/Fecha
+                    # (primer archivo que se sube después de este cambio): quedan como NaN.
+                    for col in columnas_orden:
+                        if col not in df_combinado.columns:
+                            df_combinado[col] = None
                     df_combinado = df_combinado[columnas_orden]
+
                     time.sleep(5)
                     worksheet.clear()
                     set_with_dataframe(worksheet, df_combinado.fillna(""))
