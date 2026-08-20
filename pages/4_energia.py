@@ -203,10 +203,29 @@ def _cargar_plantilla_bytes() -> BytesIO:
 def _timestamp_bogota_a_utc_iso(timestamp_bogota_str: str) -> str:
     """Convierte un Timestamp guardado en hora Bogotá (naive, 'YYYY-MM-DD HH:MM:SS')
     al formato UTC ISO exigido por la plantilla: 'AAAA-MM-DDThh:mm:ss.dsZ'.
-    Como la fuente no trae sub-segundos, el decisegundo se fija en 0."""
+    Como la fuente no trae sub-segundos, el decisegundo se fija en 0.
+    Se usa para el CSV, donde la fecha viaja como texto plano."""
     dt_bogota = pd.to_datetime(timestamp_bogota_str).tz_localize(TZ_COLOMBIA)
     dt_utc = dt_bogota.astimezone(timezone.utc)
     return dt_utc.strftime("%Y-%m-%dT%H:%M:%S.0Z")
+
+
+def _timestamp_bogota_a_utc_dt(timestamp_bogota_str: str) -> datetime:
+    """Igual que _timestamp_bogota_a_utc_iso pero devuelve un datetime real (naive,
+    sin tzinfo) en vez de texto. Se usa para el Excel: la columna B de la plantilla
+    valida las fechas con =COUNT(B2:B560001), y COUNT solo cuenta valores numéricos/
+    de fecha reales, NO texto. Si se escribe un string (aunque tenga forma de fecha),
+    Excel lo trata como texto y 'Fechas válidas' siempre da 0."""
+    dt_bogota = pd.to_datetime(timestamp_bogota_str).tz_localize(TZ_COLOMBIA)
+    dt_utc = dt_bogota.astimezone(timezone.utc)
+    return dt_utc.replace(tzinfo=None)
+
+
+# Formato de celda personalizado: la celda guarda una fecha REAL (para que
+# COUNT() la cuente como válida), pero se ve idéntica al formato pedido
+# "AAAA-MM-DDThh:mm:ss.dsZ" (el ".0Z" final se escribe como texto literal,
+# ya que la fuente no trae sub-segundos reales).
+_FORMATO_FECHA_UTC = 'yyyy-mm-dd"T"hh:mm:ss".0Z"'
 
 
 def generar_csv_maquina(df_maquina: pd.DataFrame) -> bytes:
@@ -221,14 +240,16 @@ def generar_csv_maquina(df_maquina: pd.DataFrame) -> bytes:
 def generar_xlsx_maquina(df_maquina: pd.DataFrame) -> bytes:
     """Genera el .xlsx de UNA máquina reutilizando la plantilla oficial tal cual
     (mismos encabezados, mismas fórmulas de control en D1:E3). Solo se escriben
-    los datos a partir de la fila 2 en las columnas A y B."""
+    los datos a partir de la fila 2 en las columnas A y B. La fecha se escribe
+    como valor de fecha real (no texto) para que =COUNT(...) la reconozca."""
     wb = openpyxl.load_workbook(_cargar_plantilla_bytes())
     ws = wb["DATOS"]
 
     fila = 2
-    for demanda, fecha_utc in zip(df_maquina["Potencia_kW"].values, df_maquina["Fecha_UTC"].values):
+    for demanda, fecha_utc_dt in zip(df_maquina["Potencia_kW"].values, df_maquina["Fecha_UTC_dt"].values):
         ws.cell(row=fila, column=1, value=float(demanda))
-        ws.cell(row=fila, column=2, value=fecha_utc)
+        celda_fecha = ws.cell(row=fila, column=2, value=pd.Timestamp(fecha_utc_dt).to_pydatetime())
+        celda_fecha.number_format = _FORMATO_FECHA_UTC
         fila += 1
 
     buffer = BytesIO()
@@ -647,6 +668,7 @@ if 'df_energia_extraido' in st.session_state:
         if st.button("📦 Generar archivos por máquina", use_container_width=True):
             df_export = df_mostrar.copy()
             df_export["Fecha_UTC"] = df_export["Timestamp"].apply(_timestamp_bogota_a_utc_iso)
+            df_export["Fecha_UTC_dt"] = df_export["Timestamp"].apply(_timestamp_bogota_a_utc_dt)
 
             zip_buffer = BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
