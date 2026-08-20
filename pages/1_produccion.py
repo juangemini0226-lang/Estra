@@ -34,6 +34,44 @@ def extraer_valor(fila, etiqueta, num_valores=1):
     except ValueError:
         return None if num_valores == 1 else [None] * num_valores
 
+
+def leer_existente_seguro(worksheet, columna_clave):
+    """Lee los datos ya guardados en una pestaña de Google Sheets DE FORMA SEGURA.
+
+    Por qué existe esta función: el flujo original leía la pestaña con
+    get_as_dataframe() y, si ese resultado salía vacío (o sin la columna
+    clave), asumía "no había nada que conservar" y seguía adelante hasta
+    worksheet.clear() + reescritura. Si la lectura con pandas fallaba por
+    cualquier motivo (encabezados con espacios distintos, celdas vacías mal
+    interpretadas, etc.) mientras la hoja SÍ tenía datos reales, el resultado
+    era borrar todo lo existente sin ningún error visible.
+
+    Esta función compara la lectura de pandas contra una lectura CRUDA de la
+    hoja (get_all_values(), sin pasar por pandas). Si Sheets reporta filas
+    con datos pero pandas las interpretó como vacías, se lanza una excepción
+    ANTES de que el código llegue a worksheet.clear(), deteniendo todo el
+    proceso para esa ejecución en vez de arriesgarse a perder información.
+    """
+    valores_crudos = worksheet.get_all_values()
+    # La primera fila es el encabezado; lo que sigue son datos reales.
+    filas_con_datos_en_sheet = sum(
+        1 for fila in valores_crudos[1:] if any(celda.strip() for celda in fila)
+    )
+
+    df_existente = get_as_dataframe(worksheet).dropna(how='all').dropna(axis=1, how='all')
+
+    if filas_con_datos_en_sheet > 0 and (df_existente.empty or columna_clave not in df_existente.columns):
+        raise RuntimeError(
+            f"🛑 SEGURIDAD: la pestaña '{worksheet.title}' tiene {filas_con_datos_en_sheet} "
+            f"fila(s) con datos en Google Sheets, pero no se pudieron leer correctamente "
+            f"(dataframe vacío o falta la columna clave '{columna_clave}'). "
+            f"Se detiene el proceso ANTES de borrar nada para no perder información existente. "
+            f"Revisa que el encabezado de esa pestaña tenga exactamente el texto '{columna_clave}' "
+            f"(sin espacios ni caracteres extra) y que la fila 1 no esté vacía o corrida."
+        )
+
+    return df_existente
+
 # Componente web para cargar el archivo
 uploaded_file = st.file_uploader("Por favor, sube tu archivo CSV:", type=["csv"])
 
@@ -45,7 +83,7 @@ if uploaded_file is not None:
         decoded_file = raw_data.decode('latin1')
 
     st.info("Procesando archivo... Por favor espera.")
-    
+
     datos_extraidos = []
     csv_reader = csv.reader(io.StringIO(decoded_file), delimiter=',')
 
@@ -106,7 +144,7 @@ if uploaded_file is not None:
         datos_extraidos.append(fila_dict)
 
     df_final = pd.DataFrame(datos_extraidos)
-    
+
     st.success(f"¡Extracción completada! Se procesaron {df_final.shape[0]} registros de órdenes.")
     with st.expander("👀 Ver vista previa de los datos extraídos"):
         st.dataframe(df_final.head())
@@ -119,12 +157,12 @@ if uploaded_file is not None:
                 sh = gc.open_by_url(SPREADSHEET_URL)
                 llave_primaria = 'Trabajo / Orden'
                 df_final[llave_primaria] = df_final[llave_primaria].astype(str).str.strip()
-                
+
                 # --- PESTAÑA 1 ---
                 st.write("📝 1. Actualizando 'produccion detallada'...")
                 try:
                     worksheet = sh.worksheet("produccion detallada")
-                    df_existente = get_as_dataframe(worksheet).dropna(how='all').dropna(axis=1, how='all')
+                    df_existente = leer_existente_seguro(worksheet, llave_primaria)
                 except gspread.WorksheetNotFound:
                     worksheet = sh.add_worksheet(title="produccion detallada", rows="1000", cols=str(len(df_final.columns)))
                     df_existente = pd.DataFrame()
@@ -136,6 +174,18 @@ if uploaded_file is not None:
                     df_combinado = pd.concat([df_existente, df_final], ignore_index=True)
                     df_combinado.drop_duplicates(subset=[llave_primaria], keep='last', inplace=True)
 
+                # Segunda capa de seguridad: el combinado nunca debería tener MENOS
+                # registros únicos que los que ya existían (solo se agregan o
+                # actualizan órdenes, nunca se eliminan). Si esto pasara, algo salió
+                # mal en la fusión y es más seguro detenerse que sobrescribir.
+                if len(df_combinado) < len(df_existente):
+                    raise RuntimeError(
+                        f"🛑 SEGURIDAD: el resultado combinado de 'produccion detallada' "
+                        f"({len(df_combinado)} filas) es MENOR que lo que ya había "
+                        f"({len(df_existente)} filas). Se detiene el proceso para no arriesgar "
+                        f"pérdida de datos."
+                    )
+
                 time.sleep(5)
                 worksheet.clear()
                 set_with_dataframe(worksheet, df_combinado.fillna(""))
@@ -145,22 +195,22 @@ if uploaded_file is not None:
                 st.write("📝 2. Actualizando 'produccion SEC'...")
                 columnas_sec = ["Máquina", "Tiempo Empezar", "Tiempo Final", "Trabajo / Orden", "Número de Parte", "Molde", "Producción Total"]
                 df_sec = df_final[columnas_sec].copy()
-                
+
                 for col in ["Máquina", "Trabajo / Orden", "Número de Parte", "Molde"]:
                     df_sec[col] = df_sec[col].astype(str).str.strip().replace('None', '')
-                
+
                 for col_fecha in ["Tiempo Empezar", "Tiempo Final"]:
                     mask_current = df_sec[col_fecha].astype(str).str.strip().str.lower() == 'current'
                     df_sec[col_fecha] = pd.to_datetime(df_sec[col_fecha], format='%d/%m/%Y, %H:%M', errors='coerce')
                     df_sec[col_fecha] = df_sec[col_fecha].dt.strftime('%Y-%m-%d %H:%M:%S')
                     df_sec.loc[mask_current, col_fecha] = 'En proceso'
-                    
+
                 df_sec['Producción Total'] = df_sec['Producción Total'].astype(str).str.replace('.', '', regex=False)
                 df_sec['Producción Total'] = pd.to_numeric(df_sec['Producción Total'], errors='coerce').astype('Int64')
 
                 try:
                     worksheet_sec = sh.worksheet("produccion SEC")
-                    df_existente_sec = get_as_dataframe(worksheet_sec).dropna(how='all').dropna(axis=1, how='all')
+                    df_existente_sec = leer_existente_seguro(worksheet_sec, llave_primaria)
                 except gspread.WorksheetNotFound:
                     worksheet_sec = sh.add_worksheet(title="produccion SEC", rows="1000", cols=str(len(columnas_sec)))
                     df_existente_sec = pd.DataFrame()
@@ -171,6 +221,14 @@ if uploaded_file is not None:
                     df_existente_sec[llave_primaria] = df_existente_sec[llave_primaria].astype(str).str.strip()
                     df_combinado_sec = pd.concat([df_existente_sec, df_sec], ignore_index=True)
                     df_combinado_sec.drop_duplicates(subset=[llave_primaria], keep='last', inplace=True)
+
+                if len(df_combinado_sec) < len(df_existente_sec):
+                    raise RuntimeError(
+                        f"🛑 SEGURIDAD: el resultado combinado de 'produccion SEC' "
+                        f"({len(df_combinado_sec)} filas) es MENOR que lo que ya había "
+                        f"({len(df_existente_sec)} filas). Se detiene el proceso para no arriesgar "
+                        f"pérdida de datos."
+                    )
 
                 df_combinado_sec = df_combinado_sec[columnas_sec]
                 time.sleep(5)
@@ -201,11 +259,11 @@ if uploaded_file is not None:
                 worksheet_destino.clear()
                 set_with_dataframe(worksheet_destino, df_no_conformidades.fillna(""))
                 st.write("✅ Pestaña 'No_conformidad_produccion' al día.")
-                
+
                 status.update(label="Proceso completado exitosamente", state="complete", expanded=False)
                 st.balloons()
                 st.success("🎉 ¡BASE DE DATOS ACTUALIZADA CON ÉXITO EN GOOGLE SHEETS!")
-                
+
             except Exception as e:
                 status.update(label="Ocurrió un error", state="error")
                 st.error(f"Ocurrió un error durante la actualización: {e}")
